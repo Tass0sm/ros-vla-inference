@@ -236,6 +236,10 @@ def launch_setup(context, *args, **kwargs):
     ur_control_node = Node(
         package="ur_robot_driver",
         executable="ur_ros2_control_node",
+        remappings=[
+            ("motion_control_handle/target_frame", "target_frame"),
+            ("cartesian_motion_controller/target_frame", "target_frame"),
+        ],
         parameters=[
             robot_description,
             update_rate_config_file,
@@ -356,17 +360,17 @@ def launch_setup(context, *args, **kwargs):
         "cartesian_motion_controller",
     ]
     controllers_inactive = [
-        "scaled_joint_trajectory_controller",
+        "motion_control_handle",
         "joint_trajectory_controller",
+        "scaled_joint_trajectory_controller",
         "forward_velocity_controller",
         "forward_position_controller",
         "force_mode_controller",
         "passthrough_trajectory_controller",
         "freedrive_mode_controller",
         "tool_contact_controller",
-        "cartesian_force_controller",
         "cartesian_compliance_controller",
-        "motion_control_handle",
+        "cartesian_force_controller",
     ]
 
     if use_fake_hardware.perform(context) == "true":
