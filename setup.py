@@ -26,6 +26,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
+            'gcrl_manipulation_node = diffusion_policy.gcrl_manipulation_node:main',
         ],
     },
 )
