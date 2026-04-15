@@ -43,8 +43,9 @@ from pydrake.common.eigen_geometry import Quaternion
 # from goc_mpc.goc_mpc import GraphOfConstraints, GraphOfConstraintsMPC
 # from goc_mpc.simple_drake_env import SimpleDrakeGym
 
-from agents import agents
+from agents.dsharsa import DSHARSAAgent
 from utils.flax_utils import restore_agent
+from utils.datasets import Dataset, HGCDataset
 
 from goc_demo import robotiq
 
@@ -213,6 +214,61 @@ class GCRLManipulationNode(Node):
         self.get_logger().info(
             f"Streaming pose goals at {self._rate_hz:.1f} Hz"
         )
+
+        # Initialize agent.
+        config = dict(
+            # Agent hyperparameters.
+            agent_name='dsharsa',  # Agent name.
+            lr=3e-4,  # Learning rate.
+            batch_size=1024,  # Batch size.
+            actor_hidden_dims=(1024, 1024, 1024, 1024),  # Actor network hidden dimensions.
+            value_hidden_dims=(1024, 1024, 1024, 1024),  # Value network hidden dimensions.
+            layer_norm=True,  # Whether to use layer normalization.
+            discount=0.999,  # Discount factor.
+            tau=0.005,  # Target network update rate.
+            expectile=0.9,  # IQL expectile.
+            q_agg='min',  # Aggregation function for Q values.
+            value_loss_type='bce',  # Value loss type ('squared' or 'bce').
+            flow_steps=10,  # Number of flow steps.
+            num_samples=32,  # Number of samples for the actor.
+            process_obs_type='full', # minimal, contacts, joints_minimal, joints_contacts, full
+            # Dataset hyperparameters.
+            dataset_class='HGCDataset',  # Dataset class name.
+            subgoal_steps=25,  # Subgoal steps.
+            value_p_curgoal=0.2,  # Probability of using the current state as the value goal.
+            value_p_trajgoal=0.5,  # Probability of using a future state in the same trajectory as the value goal.
+            value_p_randomgoal=0.3,  # Probability of using a random state as the value goal.
+            value_geom_sample=False,  # Whether to use geometric sampling for future value goals.
+            actor_p_curgoal=0.0,  # Probability of using the current state as the actor goal.
+            actor_p_trajgoal=1.0,  # Probability of using a future state in the same trajectory as the actor goal.
+            actor_p_randomgoal=0.0,  # Probability of using a random state as the actor goal.
+            actor_geom_sample=True,  # Whether to use geometric sampling for future actor goals.
+            gc_negative=False,  # Whether to use '0 if s == g else -1' (True) or '1 if s == g else 0' (False) as reward.
+        )
+
+        with open("/home/tassos/phd/software/GCRLManipulation/real_world_robot_data/train_dataset_rr.pkl", "rb") as f:
+            train_dataset = pickle.load(f)
+
+        train_dataset.pop("action_min", None)
+        train_dataset.pop("action_max", None)
+        train_dataset.pop("actions_norm", None)
+        train_dataset['terminals'][-1] = 1.0
+
+        train_dataset = HGCDataset(Dataset.create(**train_dataset), config)
+        example_batch = train_dataset.sample(1)
+
+        agent = DSHARSAAgent.create(
+            0,
+            example_batch,
+            config,
+            "real_world_experiment",
+        )
+        self.agent = restore_agent(
+            agent,
+            "/home/tassos/phd/software/ros_workspaces/test_ws/src/real_world_checkpoints",
+            "200000"
+        )
+
 
     @staticmethod
     def _denormalize_actions(actions_norm):
@@ -408,8 +464,10 @@ class GCRLManipulationNode(Node):
             return
 
         #######################################################################
-        #                               MPC STEP                              #
+        #                             AGENT STEP                              #
         #######################################################################
+
+        self.agent.sample_actions(obs, goals=None)
 
         # try:
         #     xi_h, xi_dot_h, _ = self.goc_mpc.step(t, x, x_dot)
