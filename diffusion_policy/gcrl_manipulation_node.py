@@ -43,6 +43,8 @@ from pydrake.common.eigen_geometry import Quaternion
 # from goc_mpc.goc_mpc import GraphOfConstraints, GraphOfConstraintsMPC
 # from goc_mpc.simple_drake_env import SimpleDrakeGym
 
+import jax
+
 from agents.dsharsa import DSHARSAAgent
 from utils.flax_utils import restore_agent
 from utils.datasets import Dataset, HGCDataset
@@ -66,7 +68,6 @@ class GCRLManipulationNode(Node):
         self.declare_parameter("right_pose_topic", "/right/cartesian_motion_controller/current_pose")
         self.declare_parameter("right_twist_topic", "/right/cartesian_motion_controller/current_twist")
         self.declare_parameter("rate_hz", 30.0)
-        self.declare_parameter("dry_run", False)
         self.declare_parameter("mpc_output_mode", "position")  # or "velocity"
         self.declare_parameter("preview_points", 1)            # 1 is fine for most
         self.declare_parameter("dt_scale", 1.0)                # stretch/shrink dt used in goal points
@@ -80,7 +81,6 @@ class GCRLManipulationNode(Node):
         self._right_twist_topic: str = self.get_parameter("right_twist_topic").value
 
         self._rate_hz: float = float(self.get_parameter("rate_hz").value)
-        self._dry_run = bool(self.get_parameter("dry_run").value)
 
         if self._rate_hz <= 0.0:
             self.get_logger().warn("rate_hz must be > 0; defaulting to 100.0")
@@ -133,24 +133,14 @@ class GCRLManipulationNode(Node):
         self.create_subscription(JointState, "/right/joint_states", self._on_right_joints, pose_qos)
 
         # Publisher to send the target pose to the robot
-        if not self._dry_run:
-            # left_target_twist_topic_name = "/left/cartesian_motion_controller/target_twist"
-            # self.left_target_twist_publisher = self.create_publisher(
-            #     TwistStamped, left_target_twist_topic_name, 10
-            # )
-            # right_target_twist_topic_name = "/right/cartesian_motion_controller/target_twist"
-            # self.right_target_twist_publisher = self.create_publisher(
-            #     TwistStamped, right_target_twist_topic_name, 10
-            # )
-
-            left_target_pose_topic_name = "/left/cartesian_motion_controller/target_frame"
-            self.left_target_pose_publisher = self.create_publisher(
-                PoseStamped, left_target_pose_topic_name, 10
-            )
-            right_target_pose_topic_name = "/right/cartesian_motion_controller/target_frame"
-            self.right_target_pose_publisher = self.create_publisher(
-                PoseStamped, right_target_pose_topic_name, 10
-            )
+        left_target_pose_topic_name = "/left/cartesian_motion_controller/target_frame"
+        self.left_target_pose_publisher = self.create_publisher(
+            PoseStamped, left_target_pose_topic_name, 10
+        )
+        right_target_pose_topic_name = "/right/cartesian_motion_controller/target_frame"
+        self.right_target_pose_publisher = self.create_publisher(
+            PoseStamped, right_target_pose_topic_name, 10
+        )
 
         # instatiate real grippers (not the cleanest, but has to be done)
         left_ip_address = "10.168.4.230"
@@ -196,25 +186,6 @@ class GCRLManipulationNode(Node):
             )
             self.subs.append(sub)
 
-        self._obs = None
-
-        # metrics
-        self.waypoint_solve_times = []
-        self.timing_solve_times = []
-        self.short_path_solve_times = []
-
-        # --- Timing ---
-        self._start_time = self.get_clock().now()
-        self.end_elapsed_time = None
-        self._timer = self.create_timer(self._period_sec, self._on_timer)
-
-        # Track last goal handle (optional)
-        self._last_goal_handle = None
-
-        self.get_logger().info(
-            f"Streaming pose goals at {self._rate_hz:.1f} Hz"
-        )
-
         # Initialize agent.
         config = dict(
             # Agent hyperparameters.
@@ -231,7 +202,7 @@ class GCRLManipulationNode(Node):
             value_loss_type='bce',  # Value loss type ('squared' or 'bce').
             flow_steps=10,  # Number of flow steps.
             num_samples=32,  # Number of samples for the actor.
-            process_obs_type='full', # minimal, contacts, joints_minimal, joints_contacts, full
+            process_obs_type='joints_contacts', # minimal, contacts, joints_minimal, joints_contacts, full
             # Dataset hyperparameters.
             dataset_class='HGCDataset',  # Dataset class name.
             subgoal_steps=25,  # Subgoal steps.
@@ -268,6 +239,19 @@ class GCRLManipulationNode(Node):
             "/home/tassos/phd/software/ros_workspaces/test_ws/src/real_world_checkpoints",
             "200000"
         )
+
+        # --- Timing ---
+        self._start_time = self.get_clock().now()
+        self.end_elapsed_time = None
+        self._timer = self.create_timer(self._period_sec, self._on_timer)
+
+        # Track last goal handle (optional)
+        self._last_goal_handle = None
+
+        self.get_logger().info(
+            f"Streaming pose goals at {self._rate_hz:.1f} Hz"
+        )
+
 
 
     @staticmethod
@@ -352,10 +336,14 @@ class GCRLManipulationNode(Node):
         return callback
 
     def _extract_state(self,
+                       left_q: np.ndarray, left_qd: np.ndarray, left_eff: np.ndarray, 
                        left_pose: Pose,
                        left_twist: Twist,
+                       left_gripper_pos: int,
+                       right_q: np.ndarray, right_qd: np.ndarray, right_eff: np.ndarray, 
                        right_pose: Pose,
                        right_twist: Twist,
+                       right_gripper_pos: int,
                        latest_positions: dict[name, tuple[float, float, float]]) -> Tuple[np.ndarray, np.ndarray]:
 
         # Only using cartesian position
@@ -370,29 +358,17 @@ class GCRLManipulationNode(Node):
                              twist.linear.z])
 
         # Reorder according to self._joints
-        left_x = pose_to_arr(left_pose)
-        left_x_dot = twist_to_arr(left_twist)
-
-        right_x = pose_to_arr(right_pose)
-        right_x_dot = twist_to_arr(right_twist)
-
-        # if kps.shape[0] != self.n_keypoints:
-        #     raise ValueError(f"Not enough or too many keypoints ({kps.shape[0]} != {self.n_keypoints})")
-
-        # kp_x = kps[:self.n_keypoints].flatten()
-        # kp_x_dot = np.zeros((self.n_keypoints, 3)).flatten()
+        left_x = np.concatenate([left_q, left_qd, left_eff, pose_to_arr(left_pose), twist_to_arr(left_twist), np.array([left_gripper_pos], dtype=float)])
+        right_x = np.concatenate([right_q, right_qd, right_eff, pose_to_arr(right_pose), twist_to_arr(right_twist), np.array([right_gripper_pos], dtype=float)])
 
         if any([name not in latest_positions for name in self.task_objects]):
             non_found = list(filter(lambda name: name not in latest_positions, self.task_objects))
             raise ValueError(f"objects {non_found} are not found")
 
         kp_x = np.array([latest_positions[name] for name in self.task_objects]).flatten()
-        kp_x_dot = np.zeros((self.n_keypoints, 3)).flatten()
 
-        # x, x_dot
         x = np.concatenate((left_x, right_x, kp_x))
-        x_dot = np.concatenate((left_x_dot, right_x_dot, kp_x_dot))
-        return x, x_dot
+        return x
 
     def _on_timer(self):
         if self._latest_left_pose is None:
@@ -439,25 +415,19 @@ class GCRLManipulationNode(Node):
         #######################################################################
 
         try:
-            if self._dry_run:
-                if self._obs is None:
-                    self._obs, _ = self._env.reset()
-                    x, x_dot = self._extract_state(self._latest_left_pose,
-                                                   self._latest_left_twist,
-                                                   self._latest_right_pose,
-                                                   self._latest_right_twist,
-                                                   self._latest_positions)
-                    self._env._set_controlled_q(x)
-                    self._env._set_controlled_qdot(x_dot)
-                    self._env.render()
-                else:
-                    x, x_dot = self._obs
-            else:
-                x, x_dot = self._extract_state(self._latest_left_pose,
-                                               self._latest_left_twist,
-                                               self._latest_right_pose,
-                                               self._latest_right_twist,
-                                               self._latest_positions)
+            x = self._extract_state(self._latest_left_q,
+                                    self._latest_left_qd,
+                                    self._latest_left_eff,
+                                    self._latest_left_pose,
+                                    self._latest_left_twist,
+                                    self.left_real_gripper.get_current_position(),
+                                    self._latest_right_q,
+                                    self._latest_right_qd,
+                                    self._latest_right_eff,
+                                    self._latest_right_pose,
+                                    self._latest_right_twist,
+                                    self.right_real_gripper.get_current_position(),
+                                    self._latest_positions)
 
         except Exception as e:
             self.get_logger().warn(f"Bad State: {e}")
@@ -467,134 +437,117 @@ class GCRLManipulationNode(Node):
         #                             AGENT STEP                              #
         #######################################################################
 
-        self.agent.sample_actions(obs, goals=None)
+        goals = np.array([
+            -1.72110903e+00, -1.93976273e+00,  5.22002220e-01, -1.05104979e+00,
+            1.57587588e+00,  5.23697662e+00, -1.31614506e-04, -1.84513117e-26,
+            0.00000000e+00,  0.00000000e+00,  0.00000000e+00,  7.85497299e-31,
+            2.15012527e+00,  3.24303937e+00, -4.10285771e-01,  2.64786303e-01,
+            -1.96256340e-02, -5.99771440e-02, -5.81776776e-01, -1.81148157e-01,
+            2.65646230e-01, -8.30052553e-07,  3.73930727e-05, -1.22814357e-04,
+            3.00000000e+00, -1.13533974e+00, -2.32519736e+00, -1.30597893e-01,
+            -1.25847332e+00,  1.56607997e+00, -1.74468881e+00, -2.80060940e-05,
+            -1.50821201e-04,  0.00000000e+00, -1.33889397e-08,  1.89813408e-23,
+            -2.12280287e-17,  2.50227642e+00,  4.68070936e+00,  3.70217741e-01,
+            1.55309319e-01, -1.14284828e-02,  3.27259526e-02, -7.74695509e-01,
+            -4.84237487e-01,  2.63735684e-01, -2.12093188e-05, -4.62308336e-05,
+            -2.12486803e-04,  3.00000000e+00, -5.81071857e-01, -1.80846428e-01,
+            2.48434154e-02, -7.73894191e-01, -4.84633055e-01,  2.26578599e-02
+        ])
+        actions_norm = self.agent.sample_actions(x, goals=goals, seed=jax.random.PRNGKey(0))
+        actions_norm = np.asarray(actions_norm)
+        actions = self._denormalize_actions(actions_norm)
 
-        # try:
-        #     xi_h, xi_dot_h, _ = self.goc_mpc.step(t, x, x_dot)
+        # action is left pose delta in world frame. latest_left_pose is in world frame
+        left_action = actions[0:3] + np.array([self._latest_left_pose.position.x,
+                                               self._latest_left_pose.position.y,
+                                               self._latest_left_pose.position.z])
+        left_gripper_pos = actions[3]
 
-        #     self.waypoint_solve_times.append(self.goc_mpc.waypoint_mpc.get_last_solve_time())
-        #     self.timing_solve_times.append(self.goc_mpc.timing_mpc.get_last_solve_time())
-        #     self.short_path_solve_times.append(self.goc_mpc.short_path_mpc.get_last_solve_time())
-        # except RuntimeError as e:
-        #     self.get_logger().error(f"goc_mpc.step failed: {e}")
-        #     print(e)
-        #     return
+        # likewise
+        right_action = actions[4:7] + np.array([self._latest_right_pose.position.x,
+                                                self._latest_right_pose.position.y,
+                                                self._latest_right_pose.position.z])
+        right_gripper_pos = actions[7]
 
-        # h, d_pos = xi_h.shape
-        # _, d_vel = xi_dot_h.shape
-
-        # xi_h = xi_h.reshape(h, self.n_agents, d_pos // self.n_agents)
-        # xi_dot_h = xi_dot_h.reshape(h, self.n_agents, d_vel // self.n_agents)
-
+        self.get_logger().info(f"left_delta: {actions[0:3]}")
+        self.get_logger().info(f"right_delta: {actions[4:7]}")
+        
         #######################################################################
         #                            EXECUTE ACTION                           #
         #######################################################################
 
-        # # 2nd timestep (not current velocity), first agent
-        # left_target_vel = xi_dot_h[1, 0]
+        left_target_pose_stamped = PoseStamped()
+        left_target_pose_stamped.header.frame_id = WORLD_FRAME
+        left_target_pose_stamped.header.stamp = self.get_clock().now().to_msg()
+        left_target_pose_stamped.pose.position.x = left_action[0]
+        left_target_pose_stamped.pose.position.y = left_action[1]
+        left_target_pose_stamped.pose.position.z = left_action[2]
+        left_target_pose_stamped.pose.orientation.w = 0.0
+        left_target_pose_stamped.pose.orientation.x = 0.0
+        left_target_pose_stamped.pose.orientation.y = 1.0
+        left_target_pose_stamped.pose.orientation.z = 0.0
 
-        # left_target_twist_stamped = TwistStamped()
-        # left_target_twist_stamped.header.frame_id = WORLD_FRAME
-        # left_target_twist_stamped.header.stamp = self.get_clock().now().to_msg()
-        # left_target_twist_stamped.twist.linear.x = left_target_vel[0]
-        # left_target_twist_stamped.twist.linear.y = left_target_vel[1]
-        # left_target_twist_stamped.twist.linear.z = left_target_vel[2]
-        # left_target_twist_stamped.twist.angular.x = left_target_vel[3]
-        # left_target_twist_stamped.twist.angular.y = left_target_vel[4]
-        # left_target_twist_stamped.twist.angular.z = left_target_vel[5]
+        right_target_pose_stamped = PoseStamped()
+        right_target_pose_stamped.header.frame_id = WORLD_FRAME
+        right_target_pose_stamped.header.stamp = self.get_clock().now().to_msg()
+        right_target_pose_stamped.pose.position.x = right_action[0]
+        right_target_pose_stamped.pose.position.y = right_action[1]
+        right_target_pose_stamped.pose.position.z = right_action[2]
+        right_target_pose_stamped.pose.orientation.w = 0.0
+        right_target_pose_stamped.pose.orientation.x = 0.0
+        right_target_pose_stamped.pose.orientation.y = 1.0
+        right_target_pose_stamped.pose.orientation.z = 0.0
 
-        # # 2nd timestep (not current velocity), second agent
-        # right_target_vel = xi_dot_h[1, 1]
+        # put in correct frame
+        right_target_pose_stamped = self._to_world(right_target_pose_stamped, target_frame="right_world")
 
-        # right_target_twist_stamped = TwistStamped()
-        # right_target_twist_stamped.header.frame_id = WORLD_FRAME
-        # right_target_twist_stamped.header.stamp = self.get_clock().now().to_msg()
-        # right_target_twist_stamped.twist.linear.x = right_target_vel[0]
-        # right_target_twist_stamped.twist.linear.y = right_target_vel[1]
-        # right_target_twist_stamped.twist.linear.z = right_target_vel[2]
-        # right_target_twist_stamped.twist.angular.x = right_target_vel[3]
-        # right_target_twist_stamped.twist.angular.y = right_target_vel[4]
-        # right_target_twist_stamped.twist.angular.z = right_target_vel[5]
+        # qpos = np.concatenate((left_target_pose, right_target_pose))
+        # self._obs, _, _, _, _ = self._env.step(qpos, grasp_cmds=self.goc_mpc.last_grasp_commands)
 
-        # left_target_pose = xi_h[3, 0]
-        # right_target_pose = xi_h[3, 1]
+        # if len(self.goc_mpc.last_grasp_commands) > 0:
+        #     self.get_logger().info(f"Grasp Commands! {self.goc_mpc.last_grasp_commands}")
+        #     for cmd, robot, point in self.goc_mpc.last_grasp_commands:
+        #         if robot == "free_body_0" or robot == "point_mass_0":
+        #             side = "left"
+        #         elif robot == "free_body_1" or robot == "point_mass_1":
+        #             side = "right"
+        #         else:
+        #             continue
+        #         self.get_logger().info(f"Paused {side}!")
+        #         self._pause_robot_delayed(
+        #             side=side,
+        #             pre_delay=self._grasp_settle_sec,
+        #             post_delay=self._grasp_pause_after_cmd_sec,
+        #             gripper_cmd=cmd
+        #         )
 
-        # left_target_pose_stamped = PoseStamped()
-        # left_target_pose_stamped.header.frame_id = WORLD_FRAME
-        # left_target_pose_stamped.header.stamp = self.get_clock().now().to_msg()
-        # left_target_pose_stamped.pose.position.x = left_target_pose[0]
-        # left_target_pose_stamped.pose.position.y = left_target_pose[1]
-        # left_target_pose_stamped.pose.position.z = left_target_pose[2]
-        # left_target_pose_stamped.pose.orientation.w = 0.0
-        # left_target_pose_stamped.pose.orientation.x = 0.0
-        # left_target_pose_stamped.pose.orientation.y = 1.0
-        # left_target_pose_stamped.pose.orientation.z = 0.0
+        # if len(self.goc_mpc.last_cycle_backtracked_phases) > 0:
+        #     for agent_idx, new_phase in self.goc_mpc.last_cycle_backtracked_phases.items():
+        #         if agent_idx == 0:
+        #             side = "left"
+        #         elif agent_idx == 1:
+        #             side = "right"
+        #         else:
+        #             continue
+        #         self.get_logger().info(f"Paused {side} to backtrack!")
+        #         self._pause_robot_delayed(
+        #             side=side,
+        #             pre_delay=0.0,
+        #             post_delay=0.0,
+        #             gripper_cmd="release"
+        #         )
 
-        # right_target_pose_stamped = PoseStamped()
-        # right_target_pose_stamped.header.frame_id = WORLD_FRAME
-        # right_target_pose_stamped.header.stamp = self.get_clock().now().to_msg()
-        # right_target_pose_stamped.pose.position.x = right_target_pose[0]
-        # right_target_pose_stamped.pose.position.y = right_target_pose[1]
-        # right_target_pose_stamped.pose.position.z = right_target_pose[2]
-        # right_target_pose_stamped.pose.orientation.w = 0.0
-        # right_target_pose_stamped.pose.orientation.x = 0.0
-        # right_target_pose_stamped.pose.orientation.y = 1.0
-        # right_target_pose_stamped.pose.orientation.z = 0.0
+        # if not self.left_robot_paused:
+        #     self.left_target_twist_publisher.publish(left_target_twist_stamped)
 
-        # # put in correct frame
-        # right_target_pose_stamped = self._to_world(right_target_pose_stamped, target_frame="right_world")
+        # if not self.right_robot_paused:
+        #     self.right_target_twist_publisher.publish(right_target_twist_stamped)
 
-        # # qpos = np.concatenate((left_target_pose, right_target_pose))
-        # if self._dry_run:
-        #     # self._obs, _, _, _, _ = self._env.step(qpos, grasp_cmds=self.goc_mpc.last_grasp_commands)
-        #     pass
-        # else:
-        #     # self._obs, _, _, _, _ = self._env.step(qpos, grasp_cmds=self.goc_mpc.last_grasp_commands)
+        # if not self.left_robot_paused and left_target_pose_stamped is not None:
+        #     self.left_target_pose_publisher.publish(left_target_pose_stamped)
 
-        #     if len(self.goc_mpc.last_grasp_commands) > 0:
-        #         self.get_logger().info(f"Grasp Commands! {self.goc_mpc.last_grasp_commands}")
-        #         for cmd, robot, point in self.goc_mpc.last_grasp_commands:
-        #             if robot == "free_body_0" or robot == "point_mass_0":
-        #                 side = "left"
-        #             elif robot == "free_body_1" or robot == "point_mass_1":
-        #                 side = "right"
-        #             else:
-        #                 continue
-        #             self.get_logger().info(f"Paused {side}!")
-        #             self._pause_robot_delayed(
-        #                 side=side,
-        #                 pre_delay=self._grasp_settle_sec,
-        #                 post_delay=self._grasp_pause_after_cmd_sec,
-        #                 gripper_cmd=cmd
-        #             )
-
-        #     if len(self.goc_mpc.last_cycle_backtracked_phases) > 0:
-        #         for agent_idx, new_phase in self.goc_mpc.last_cycle_backtracked_phases.items():
-        #             if agent_idx == 0:
-        #                 side = "left"
-        #             elif agent_idx == 1:
-        #                 side = "right"
-        #             else:
-        #                 continue
-        #             self.get_logger().info(f"Paused {side} to backtrack!")
-        #             self._pause_robot_delayed(
-        #                 side=side,
-        #                 pre_delay=0.0,
-        #                 post_delay=0.0,
-        #                 gripper_cmd="release"
-        #             )
-
-        #     # if not self.left_robot_paused:
-        #     #     self.left_target_twist_publisher.publish(left_target_twist_stamped)
-
-        #     # if not self.right_robot_paused:
-        #     #     self.right_target_twist_publisher.publish(right_target_twist_stamped)
-
-        #     if not self.left_robot_paused and left_target_pose_stamped is not None:
-        #         self.left_target_pose_publisher.publish(left_target_pose_stamped)
-
-        #     if not self.right_robot_paused and right_target_pose_stamped is not None:
-        #         self.right_target_pose_publisher.publish(right_target_pose_stamped)
+        # if not self.right_robot_paused and right_target_pose_stamped is not None:
+        #     self.right_target_pose_publisher.publish(right_target_pose_stamped)
 
     # --- Helpers ---
 
