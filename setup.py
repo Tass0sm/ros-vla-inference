@@ -27,6 +27,7 @@ setup(
     entry_points={
         'console_scripts': [
             'gcrl_manipulation_node = diffusion_policy.gcrl_manipulation_node:main',
+            'one_robot_gcrl_manipulation_node = diffusion_policy.one_robot_gcrl_manipulation_node:main',
         ],
     },
 )
