@@ -6,7 +6,7 @@ After turning on the robot and loading the correct installation file:
 
 ** Connect to the robot
 
-: ros2 launch diffusion_policy ur_control.launch.py ur_type:=ur5e robot_ip:=10.8.164.249
+: ros2 launch diffusion_policy ur_control.launch.py ur_type:=ur5e robot_ip:=10.168.4.249 reverse_port:=50005 script_sender_port:=50006 trajectory_port:=50007 script_command_port:=50008
 
 ** Launch the colors tracker
 
@@ -22,4 +22,18 @@ Then, go to rviz, add an InteractiveMarkerNode, set its topic to
 
 ** Run a controller
 
+: source ../../gcrl-venv/bin/activate
 : ros2 run diffusion_policy one_robot_gcrl_manipulation_node
+
+** For Data collection
+
+: ros2 run goc_demo goc_cartesian_demo_node_1_robot --task pick_and_place
+
+** For diffusion policy
+
+#+begin_src shell
+source ./trackers-venv/bin/activate
+ros2 run diffusion_policy dp_inference_node --ros-args \
+    -p ckpt_path:=/path/to/model.pth \
+    -p obj_pose_topic:=/cheezit/pose
+#+end_src
