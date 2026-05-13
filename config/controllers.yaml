@@ -256,6 +256,14 @@ cartesian_compliance_controller:
         rot_y: 20.0
         rot_z: 20.0
 
+    damping:
+        trans_x: 10.0
+        trans_y: 10.0
+        trans_z: 10.0
+        rot_x: 1.0
+        rot_y: 1.0
+        rot_z: 1.0
+
     solver:
         error_scale: 0.5
         iterations: 1

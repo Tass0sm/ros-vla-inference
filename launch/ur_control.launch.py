@@ -54,6 +54,7 @@ def launch_setup(context):
     robot_ip = LaunchConfiguration("robot_ip")
     # General arguments
     controllers_file = LaunchConfiguration("controllers_file")
+    kinematics_params_file = LaunchConfiguration("kinematics_params_file")
     description_launchfile = LaunchConfiguration("description_launchfile")
     use_mock_hardware = LaunchConfiguration("use_mock_hardware")
     controller_spawner_timeout = LaunchConfiguration("controller_spawner_timeout")
@@ -176,6 +177,8 @@ def launch_setup(context):
         ],
     )
 
+    namespace = context.launch_configurations.get('ros_namespace', "")
+
     # Spawn controllers
     def controller_spawner(controllers, active=True):
         inactive_flags = ["--inactive"] if not active else []
@@ -184,7 +187,7 @@ def launch_setup(context):
             executable="spawner",
             arguments=[
                 "--controller-manager",
-                "/controller_manager",
+                namespace+"/controller_manager",
                 "--controller-manager-timeout",
                 controller_spawner_timeout,
             ]
@@ -199,7 +202,6 @@ def launch_setup(context):
         "force_torque_sensor_broadcaster",
         "tcp_pose_broadcaster",
         "ur_configuration_controller",
-        "cartesian_motion_controller",
     ]
     controllers_inactive = [
         "motion_control_handle",
@@ -211,12 +213,16 @@ def launch_setup(context):
         "passthrough_trajectory_controller",
         "freedrive_mode_controller",
         "tool_contact_controller",
-        "cartesian_compliance_controller",
+        "cartesian_motion_controller",
         # "cartesian_force_controller",
+        "cartesian_compliance_controller",
     ]
     if activate_joint_controller.perform(context) == "true":
-        controllers_active.append(initial_joint_controller.perform(context))
-        controllers_inactive.remove(initial_joint_controller.perform(context))
+        controller_name = initial_joint_controller.perform(context)
+        if controller_name not in controllers_active:
+            controllers_active.append(controller_name)
+        if controller_name in controllers_inactive:
+            controllers_inactive.remove(controller_name)
 
     if use_mock_hardware.perform(context) == "true":
         controllers_active.remove("tcp_pose_broadcaster")
@@ -231,6 +237,7 @@ def launch_setup(context):
         launch_arguments={
             "robot_ip": robot_ip,
             "ur_type": ur_type,
+            "kinematics_params_file": kinematics_params_file
         }.items(),
     )
 
@@ -312,6 +319,19 @@ def generate_launch_description():
     )
     declared_arguments.append(
         DeclareLaunchArgument(
+            "kinematics_params_file",
+            default_value=PathJoinSubstitution(
+                [
+                    FindPackageShare("diffusion_policy"),
+                    "config",
+                    "kinematics_params.yaml",
+                ]
+            ),
+            description="The calibration configuration of the actual robot used.",
+        )
+    )
+    declared_arguments.append(
+        DeclareLaunchArgument(
             "description_launchfile",
             default_value=PathJoinSubstitution(
                 [FindPackageShare("ur_robot_driver"), "launch", "ur_rsp.launch.py"]
@@ -362,7 +382,7 @@ def generate_launch_description():
     declared_arguments.append(
         DeclareLaunchArgument(
             "initial_joint_controller",
-            default_value="scaled_joint_trajectory_controller",
+            default_value="cartesian_motion_controller",
             choices=[
                 "scaled_joint_trajectory_controller",
                 "joint_trajectory_controller",
@@ -370,6 +390,7 @@ def generate_launch_description():
                 "forward_position_controller",
                 "freedrive_mode_controller",
                 "passthrough_trajectory_controller",
+                "cartesian_motion_controller",
             ],
             description="Initially loaded robot controller.",
         )

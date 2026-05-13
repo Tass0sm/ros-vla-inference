@@ -1,0 +1,25 @@
+#+title: ur_data_collection
+
+* Usage
+
+After turning on the robot and loading the correct installation file:
+
+** Connect to the robot
+
+: ros2 launch diffusion_policy ur_control.launch.py ur_type:=ur5e robot_ip:=10.8.164.249
+
+** Launch the colors tracker
+
+: ros2 launch goc_demo track_colors.launch.py
+
+** Load the saved hand-eye calibration for the camera
+
+: ros2 launch diffusion_policy saved_calibration.launch.py
+
+Then, go to rviz, add an InteractiveMarkerNode, set its topic to
+/tf_tweaker_node, right click on the marker in the central window, and press
+"publish static transform"
+
+** Run a controller
+
+: ros2 run diffusion_policy one_robot_gcrl_manipulation_node
