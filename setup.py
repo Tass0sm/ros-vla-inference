@@ -28,6 +28,7 @@ setup(
         'console_scripts': [
             'gcrl_manipulation_node = diffusion_policy.gcrl_manipulation_node:main',
             'one_robot_gcrl_manipulation_node = diffusion_policy.one_robot_gcrl_manipulation_node:main',
+            'dp_inference_node = diffusion_policy.dp_inference_node:main',
         ],
     },
 )
