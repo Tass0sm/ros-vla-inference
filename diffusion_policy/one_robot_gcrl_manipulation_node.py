@@ -189,9 +189,6 @@ class OneRobotGCRLManipulationNode(Node):
 
         train_dataset['terminals'][-1] = 1.0
 
-        # TEMPORARY WHILE WAITING FOR OTHER ONE
-        train_dataset["actions"] = train_dataset["actions"][:, :3]
-        
         train_dataset = PixelHGCDataset(Dataset.create(**train_dataset), config)
 
         goal_index = np.argwhere(train_dataset.dataset["terminals"])[0].item()
@@ -207,7 +204,7 @@ class OneRobotGCRLManipulationNode(Node):
         )
         self.agent = restore_agent(
             agent,
-            "/home/tassos/phd/software/ros_workspaces/test_ws/src/real_world_checkpoints/h_flow_hjb_gcivl",
+            "/home/tassos/phd/software/ros_workspaces/test_ws/src/real_world_checkpoints/h_flow_hjb_gcivl/version2",
             "200000"
         )
 
@@ -334,18 +331,21 @@ class OneRobotGCRLManipulationNode(Node):
         #                             AGENT STEP                              #
         #######################################################################
 
-        actions_norm = self.agent.sample_actions(observation, proprioception,
-                                                 goals=self._goal_obs, seed=jax.random.PRNGKey(0))
-        actions_norm = np.asarray(actions_norm)
-        actions = self._denormalize_actions(actions_norm)
+        action_norm = self.agent.sample_actions(observation, proprioception,
+                                                goals=self._goal_obs, seed=jax.random.PRNGKey(0))
+        action_norm = np.asarray(action_norm)
+        delta_norm = action_norm[:3]
+        delta = self._denormalize_actions(delta_norm)
 
         # action is left pose delta in world frame. latest_left_pose is in world frame
-        action = actions[0:3] + np.array([self._latest_pose.position.x,
-                                          self._latest_pose.position.y,
-                                          self._latest_pose.position.z])
-        # gripper_pos = actions[3]
+        target = delta + np.array([self._latest_pose.position.x,
+                                   self._latest_pose.position.y,
+                                   self._latest_pose.position.z])
+        gripper_target = action_norm[3:] # just [-1.0] or [1.0]
 
-        self.get_logger().info(f"delta: {actions[0:3]}")
+        self.get_logger().info(f"delta: {delta}, gripper: {gripper_target}")
+
+        action = np.concatenate((target, gripper_target), axis=-1)
 
         #######################################################################
         #                            EXECUTE ACTION                           #
