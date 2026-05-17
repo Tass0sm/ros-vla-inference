@@ -91,10 +91,10 @@ def _dynamics_rollout_rw(s0, ac, model, st):
     return torch.stack(states, dim=1)
 
 
-def _safety_robustness_rw(s0, ac, model, st, box, tau=0.02):
+def _safety_robustness_rw(s0, ac, model, st, box, tau=0.02, rollout_scale=1.0):
     """Smooth-min robustness of G(always outside safety box) over predicted trajectory."""
     x_min, x_max, y_min, y_max, margin = box
-    pred_xy = _dynamics_rollout_rw(s0, ac, model, st)[..., 0:2]
+    pred_xy = _dynamics_rollout_rw(s0, rollout_scale * ac, model, st)[..., 0:2]
     cx = torch.tensor([(x_min + x_max) / 2, (y_min + y_max) / 2],
                       device=pred_xy.device, dtype=pred_xy.dtype)
     hx = torch.tensor([(x_max - x_min) / 2, (y_max - y_min) / 2],
@@ -108,7 +108,7 @@ def _safety_robustness_rw(s0, ac, model, st, box, tau=0.02):
 
 def _refine_for_safety(s_np, ac_np, model, st, device, box,
                        guidance_scale=1.0, gradient_steps=20, step_size=0.03,
-                       action_reg=0.05, tau=0.02):
+                       action_reg=0.05, tau=0.02, rollout_scale=1.0):
     """Refine action chunk via gradient ascent on safety robustness (F_switch_G_safety.ipynb)."""
     s0 = torch.as_tensor(s_np, device=device, dtype=torch.float32).unsqueeze(0)
     orig = torch.as_tensor(ac_np[None], device=device, dtype=torch.float32)
@@ -116,13 +116,39 @@ def _refine_for_safety(s_np, ac_np, model, st, device, box,
     opt = torch.optim.Adam([ac], lr=step_size)
     for _ in range(gradient_steps):
         opt.zero_grad(set_to_none=True)
-        obj = (guidance_scale * _safety_robustness_rw(s0, ac, model, st, box, tau)
+        obj = (guidance_scale * _safety_robustness_rw(s0, ac, model, st, box, tau, rollout_scale=rollout_scale)
                - action_reg * torch.mean((ac - orig) ** 2, dim=(1, 2)))
         (-obj.mean()).backward()
         opt.step()
         with torch.no_grad():
             ac.clamp_(-1.0, 1.0)
     return ac[0].detach().cpu().numpy().astype(np.float32)
+
+
+# _PROBE_VALUES = [0.001, 0.005, 0.01, 0.05, 0.1, 0.5]
+_PROBE_VALUES = [0.0000001, 0.000001, 0.00001, 0.0001, 0.001, 0.01, 0.1]
+
+
+def _probe_param(s_np, ac_np, model, st, device, box, probe_param, probe_values=_PROBE_VALUES, **fixed_kwargs):
+    """Vary one refinement parameter across _PROBE_VALUES; all others come from fixed_kwargs or defaults."""
+    s0 = torch.as_tensor(s_np, device=device, dtype=torch.float32).unsqueeze(0)
+    rollout_scale = fixed_kwargs["rollout_scale"]
+
+    def _predict(ac_t):
+        with torch.no_grad():
+            return _dynamics_rollout_rw(s0, rollout_scale * ac_t, model, st)[0].cpu().numpy().tolist()
+
+    orig_t = torch.as_tensor(ac_np[None], device=device, dtype=torch.float32)
+    results = [{"probe_param": probe_param, "probe_value": 0.0,
+                "optimized_actions": ac_np.tolist(), "predicted_states": _predict(orig_t)}]
+    for v in probe_values:
+        refined = _refine_for_safety(s_np, ac_np, model, st, device, box, **{**fixed_kwargs, probe_param: v})
+        results.append({
+            "probe_param": probe_param, "probe_value": v,
+            "optimized_actions": refined.tolist(),
+            "predicted_states": _predict(torch.as_tensor(refined[None], device=device, dtype=torch.float32)),
+        })
+    return results
 
 
 WORLD_FRAME = "world"
@@ -213,7 +239,12 @@ class DPInferenceNode(Node):
         self.declare_parameter("target_chain", "")  # "idx:maximize;idx:minimize;..."
         self.declare_parameter("wrist_joint_topic", "/joint_states")
         self.declare_parameter("wrist_joint_name", "wrist_3_joint")
+        self.declare_parameter("enable_safety_guidance", True)
         self.declare_parameter("guidance_scale", 1.0)
+        self.declare_parameter("action_reg", 0.05)
+        self.declare_parameter("gradient_steps", 20)
+        self.declare_parameter("step_size", 0.0001)
+        self.declare_parameter("rollout_scale", 1.0)
         self.declare_parameter("safety_x_min", SAFETY_X_MIN)
         self.declare_parameter("safety_x_max", SAFETY_X_MAX)
         self.declare_parameter("safety_y_min", SAFETY_Y_MIN)
@@ -232,7 +263,12 @@ class DPInferenceNode(Node):
         self._target_label_idx: int = int(self.get_parameter("target_label_idx").value)
         self._wrist_joint_topic: str = self.get_parameter("wrist_joint_topic").value
         self._wrist_joint_name: str = self.get_parameter("wrist_joint_name").value
+        self._enable_safety_guidance: bool = bool(self.get_parameter("enable_safety_guidance").value)
         self._guidance_scale: float = float(self.get_parameter("guidance_scale").value)
+        self._action_reg: float = float(self.get_parameter("action_reg").value)
+        self._gradient_steps: int = int(self.get_parameter("gradient_steps").value)
+        self._step_size: float = float(self.get_parameter("step_size").value)
+        self._rollout_scale: float = float(self.get_parameter("rollout_scale").value)
         self._safety_x_min: float = float(self.get_parameter("safety_x_min").value)
         self._safety_x_max: float = float(self.get_parameter("safety_x_max").value)
         self._safety_y_min: float = float(self.get_parameter("safety_y_min").value)
@@ -325,6 +361,7 @@ class DPInferenceNode(Node):
         self.get_logger().info("Diffusion policy loaded.")
 
         # --- Load automaton world model ---
+        self._label_probs = None
         self._automaton_model = None
         self._automaton_stats = None
         self._automaton_meta = None
@@ -376,6 +413,10 @@ class DPInferenceNode(Node):
                 "margin": self._safety_margin,
             },
             "guidance_scale": self._guidance_scale,
+            "action_reg": self._action_reg,
+            "gradient_steps": self._gradient_steps,
+            "step_size": self._step_size,
+            "rollout_scale": self._rollout_scale,
         }) + "\n")
         self._rollout_log_file.flush()
         self.get_logger().info(f"Rollout log: {self._rollout_log_path}")
@@ -385,7 +426,7 @@ class DPInferenceNode(Node):
         self.get_logger().info(f"DP inference node running at {self._rate_hz:.1f} Hz")
 
     # ---------------------------------------------------------------------- #
-    #  Callbacks                                                               #
+    #  Callbacks                                                             #
     # ---------------------------------------------------------------------- #
 
     def _on_pose(self, msg: PoseStamped):
@@ -449,11 +490,7 @@ class DPInferenceNode(Node):
             "cheezit_pos":    cheezit_pos,
             "cheezit_rot6d":  cheezit_rot6d,
         }
-        self._rollout_log_file.write(json.dumps({
-            "t_ns": self.get_clock().now().nanoseconds,
-            "eef_xyz": eef_pos.tolist(),
-        }) + "\n")
-        self._rollout_log_file.flush()
+
         self._obs_deque.append(step_obs)
 
         # Pad deque with repeated first observation until full
@@ -475,8 +512,13 @@ class DPInferenceNode(Node):
             _, current_label = self._current_automaton_state_label(step_obs)
             if self._check_and_advance_chain(current_label):
                 self._action_queue.clear()
+        else:
+            current_label = None
+
         if self._chain_done:
             return
+
+        action = None
 
         if not self._robot_paused and not self._awaiting_chunk_resume:
 
@@ -547,6 +589,17 @@ class DPInferenceNode(Node):
                     gripper_cmd="open",
                 )
 
+        self._rollout_log_file.write(json.dumps({
+            "t_ns": self.get_clock().now().nanoseconds,
+            "action": action.tolist() if action is not None else None,
+            "current_label": current_label.tolist() if current_label is not None else None,
+            "label_probs": self._label_probs.tolist() if self._label_probs is not None else None,
+        } | {
+            key: value.tolist() for key, value in step_obs.items()
+        }) + "\n")
+        self._rollout_log_file.flush()
+
+
 
     # ---------------------------------------------------------------------- #
     #  Action queue helpers                                                    #
@@ -566,14 +619,14 @@ class DPInferenceNode(Node):
 
         if self._automaton_model is not None:
             automaton_state, automaton_label = self._current_automaton_state_label(step_obs)
-            label_probs = self._predict_future_label_probs(automaton_state, automaton_label, action_chunks)
+            self._label_probs = self._predict_future_label_probs(automaton_state, automaton_label, action_chunks)
             if self._target_chain and not self._chain_done:
                 idx, mode = self._target_chain[self._chain_pos]
-                scores = label_probs[:, idx]
+                scores = self._label_probs[:, idx]
                 selected_idx = int(np.argmax(scores)) if mode == "maximize" else int(np.argmin(scores))
                 score_label = f"{'max' if mode == 'maximize' else 'min'} p({self._automaton_meta['label_names'][idx]})"
             else:
-                scores = label_probs[:, self._target_label_idx]
+                scores = self._label_probs[:, self._target_label_idx]
                 selected_idx = int(np.argmax(scores))
                 score_label = f"p({self._automaton_meta['label_names'][self._target_label_idx]})"
         else:
@@ -588,15 +641,50 @@ class DPInferenceNode(Node):
         # self.get_logger().info(f"\n\nstacked_obs:\n{_obs_lines}\n  gripper_raw (last 2): {_gripper_hist}\n\n")
 
         chunk_np = action_chunks[selected_idx]  # (H, A) unnormalized
-        if self._dynamics_model is not None:
+        if self._dynamics_model is not None and self._enable_safety_guidance:
             _s = np.concatenate([
                 step_obs["eef_pos"], step_obs["eef_rot6d"],
                 step_obs["gripper_binary"], step_obs["cheezit_pos"], step_obs["cheezit_rot6d"],
             ]).astype(np.float32)
             _box = (self._safety_x_min, self._safety_x_max,
                     self._safety_y_min, self._safety_y_max, self._safety_margin)
-            chunk_np = _refine_for_safety(_s, chunk_np, self._dynamics_model, self._dynamics_stats_t,
-                                          self._device, _box, guidance_scale=self._guidance_scale)
+            if self._guidance_scale == 0.0:
+                probe = _probe_param(_s, chunk_np, self._dynamics_model, self._dynamics_stats_t, self._device, _box,
+                                     "guidance_scale",
+                                     step_size=self._step_size, action_reg=self._action_reg,
+                                     gradient_steps=self._gradient_steps, rollout_scale=self._rollout_scale)
+                self._rollout_log_file.write(json.dumps({"type": "probe_param", "entries": probe}) + "\n")
+                self._rollout_log_file.flush()
+            elif self._step_size == 0.0:
+                probe = _probe_param(_s, chunk_np, self._dynamics_model, self._dynamics_stats_t, self._device, _box,
+                                     "step_size",
+                                     guidance_scale=self._guidance_scale, action_reg=self._action_reg,
+                                     gradient_steps=self._gradient_steps, rollout_scale=self._rollout_scale)
+                self._rollout_log_file.write(json.dumps({"type": "probe_param", "entries": probe}) + "\n")
+                self._rollout_log_file.flush()
+            elif self._action_reg == 0.0:
+                probe = _probe_param(_s, chunk_np, self._dynamics_model, self._dynamics_stats_t, self._device, _box,
+                                     "action_reg",
+                                     probe_values=[0.0005, 0.005, 0.05, 0.5, 5],
+                                     step_size=self._step_size, guidance_scale=self._guidance_scale,
+                                     gradient_steps=self._gradient_steps, rollout_scale=self._rollout_scale)
+                self._rollout_log_file.write(json.dumps({"type": "probe_param", "entries": probe}) + "\n")
+                self._rollout_log_file.flush()
+            elif self._gradient_steps == 0:
+                probe = _probe_param(_s, chunk_np, self._dynamics_model, self._dynamics_stats_t, self._device, _box,
+                                     "gradient_steps", 
+                                     probe_values=[10, 20, 50, 100],
+                                     guidance_scale=self._guidance_scale, step_size=self._step_size,
+                                     action_reg=self._action_reg, rollout_scale=self._rollout_scale)
+                self._rollout_log_file.write(json.dumps({"type": "probe_param", "entries": probe}) + "\n")
+                self._rollout_log_file.flush()
+            else:
+                chunk_np = _refine_for_safety(_s, chunk_np, self._dynamics_model, self._dynamics_stats_t,
+                                              self._device, _box,
+                                              guidance_scale=self._guidance_scale,
+                                              action_reg=self._action_reg,
+                                              step_size=self._step_size,
+                                              rollout_scale=self._rollout_scale)
         self._action_queue = list(chunk_np)
 
         if self._automaton_model is not None:
@@ -604,7 +692,7 @@ class DPInferenceNode(Node):
             col_w = max(max(len(n) for n in label_names), 6)
             header = f"  {'':3s}  " + "  ".join(f"{n:>{col_w}}" for n in label_names)
             rows = []
-            for i, probs in enumerate(label_probs):
+            for i, probs in enumerate(self._label_probs):
                 marker = "* " if i == selected_idx else "  "
                 rows.append(f"  {marker}{i:3d}  " + "  ".join(f"{p:{col_w}.4f}" for p in probs))
             current_label_line = "  current label:  " + "  ".join(
@@ -706,7 +794,7 @@ class DPInferenceNode(Node):
         automaton_horizon = action_chunk_dim // action_dim
 
         # Flatten only the automaton-horizon steps; ignore any extra policy steps
-        flat_chunks = action_chunks[:, :automaton_horizon, :].reshape(n_candidates, -1)
+        flat_chunks = self._rollout_scale * action_chunks[:, :automaton_horizon, :].reshape(n_candidates, -1)
 
         states = np.repeat(automaton_state[None, :], n_candidates, axis=0)
         labels = np.repeat(automaton_label[None, :], n_candidates, axis=0)
