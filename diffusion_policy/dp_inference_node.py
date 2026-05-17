@@ -64,9 +64,9 @@ _DYNAMICS_CKPT = Path(
 _SAFETY_LOG_DIR = Path("/home/moritz/src/guided-diffusion/outputs/real_world/dynamics_guidance")
 
 # EEF must stay outside x ∈ [SAFETY_X_MIN, SAFETY_X_MAX], y ∈ [SAFETY_Y_MIN, SAFETY_Y_MAX]
-SAFETY_X_MIN, SAFETY_X_MAX = -0.58, -0.55
-SAFETY_Y_MIN, SAFETY_Y_MAX = 0.1, 0.4
-SAFETY_MARGIN = 0.05
+SAFETY_X_MIN, SAFETY_X_MAX = -0.55, -0.51
+SAFETY_Y_MIN, SAFETY_Y_MAX = -0.1, -0.07
+SAFETY_MARGIN = 0.005
 
 
 def _project_rw_dyn_state(s):
@@ -91,21 +91,22 @@ def _dynamics_rollout_rw(s0, ac, model, st):
     return torch.stack(states, dim=1)
 
 
-def _safety_robustness_rw(s0, ac, model, st, tau=0.02):
+def _safety_robustness_rw(s0, ac, model, st, box, tau=0.02):
     """Smooth-min robustness of G(always outside safety box) over predicted trajectory."""
+    x_min, x_max, y_min, y_max, margin = box
     pred_xy = _dynamics_rollout_rw(s0, ac, model, st)[..., 0:2]
-    cx = torch.tensor([(SAFETY_X_MIN + SAFETY_X_MAX) / 2, (SAFETY_Y_MIN + SAFETY_Y_MAX) / 2],
+    cx = torch.tensor([(x_min + x_max) / 2, (y_min + y_max) / 2],
                       device=pred_xy.device, dtype=pred_xy.dtype)
-    hx = torch.tensor([(SAFETY_X_MAX - SAFETY_X_MIN) / 2, (SAFETY_Y_MAX - SAFETY_Y_MIN) / 2],
+    hx = torch.tensor([(x_max - x_min) / 2, (y_max - y_min) / 2],
                       device=pred_xy.device, dtype=pred_xy.dtype)
     q = torch.abs(pred_xy - cx) - hx
     d = (torch.linalg.norm(torch.clamp(q, min=0.0), dim=-1)
          + torch.minimum(torch.maximum(q[..., 0], q[..., 1]),
                          torch.zeros((), device=pred_xy.device, dtype=pred_xy.dtype)))
-    return -tau * torch.logsumexp(-torch.clamp(d, max=SAFETY_MARGIN) / tau, dim=-1)
+    return -tau * torch.logsumexp(-torch.clamp(d, max=margin) / tau, dim=-1)
 
 
-def _refine_for_safety(s_np, ac_np, model, st, device,
+def _refine_for_safety(s_np, ac_np, model, st, device, box,
                        guidance_scale=1.0, gradient_steps=20, step_size=0.03,
                        action_reg=0.05, tau=0.02):
     """Refine action chunk via gradient ascent on safety robustness (F_switch_G_safety.ipynb)."""
@@ -115,7 +116,7 @@ def _refine_for_safety(s_np, ac_np, model, st, device,
     opt = torch.optim.Adam([ac], lr=step_size)
     for _ in range(gradient_steps):
         opt.zero_grad(set_to_none=True)
-        obj = (guidance_scale * _safety_robustness_rw(s0, ac, model, st, tau)
+        obj = (guidance_scale * _safety_robustness_rw(s0, ac, model, st, box, tau)
                - action_reg * torch.mean((ac - orig) ** 2, dim=(1, 2)))
         (-obj.mean()).backward()
         opt.step()
@@ -213,6 +214,11 @@ class DPInferenceNode(Node):
         self.declare_parameter("wrist_joint_topic", "/joint_states")
         self.declare_parameter("wrist_joint_name", "wrist_3_joint")
         self.declare_parameter("guidance_scale", 1.0)
+        self.declare_parameter("safety_x_min", SAFETY_X_MIN)
+        self.declare_parameter("safety_x_max", SAFETY_X_MAX)
+        self.declare_parameter("safety_y_min", SAFETY_Y_MIN)
+        self.declare_parameter("safety_y_max", SAFETY_Y_MAX)
+        self.declare_parameter("safety_margin", SAFETY_MARGIN)
 
         self._pose_topic: str = self.get_parameter("pose_topic").value
         self._twist_topic: str = self.get_parameter("twist_topic").value
@@ -226,7 +232,12 @@ class DPInferenceNode(Node):
         self._target_label_idx: int = int(self.get_parameter("target_label_idx").value)
         self._wrist_joint_topic: str = self.get_parameter("wrist_joint_topic").value
         self._wrist_joint_name: str = self.get_parameter("wrist_joint_name").value
-        self._guidance_scale: float = self.get_parameter("guidance_scale").value
+        self._guidance_scale: float = float(self.get_parameter("guidance_scale").value)
+        self._safety_x_min: float = float(self.get_parameter("safety_x_min").value)
+        self._safety_x_max: float = float(self.get_parameter("safety_x_max").value)
+        self._safety_y_min: float = float(self.get_parameter("safety_y_min").value)
+        self._safety_y_max: float = float(self.get_parameter("safety_y_max").value)
+        self._safety_margin: float = float(self.get_parameter("safety_margin").value)
         try:
             _chain_raw = self.get_parameter("target_chain").value or ""
             self._target_chain: list = [
@@ -357,6 +368,16 @@ class DPInferenceNode(Node):
         _log_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         self._rollout_log_path = _SAFETY_LOG_DIR / f"rollout_{_log_ts}.jsonl"
         self._rollout_log_file = open(self._rollout_log_path, "w")
+        self._rollout_log_file.write(json.dumps({
+            "type": "params",
+            "safety_box": {
+                "x_min": self._safety_x_min, "x_max": self._safety_x_max,
+                "y_min": self._safety_y_min, "y_max": self._safety_y_max,
+                "margin": self._safety_margin,
+            },
+            "guidance_scale": self._guidance_scale,
+        }) + "\n")
+        self._rollout_log_file.flush()
         self.get_logger().info(f"Rollout log: {self._rollout_log_path}")
 
         # --- Timer ---
@@ -572,8 +593,10 @@ class DPInferenceNode(Node):
                 step_obs["eef_pos"], step_obs["eef_rot6d"],
                 step_obs["gripper_binary"], step_obs["cheezit_pos"], step_obs["cheezit_rot6d"],
             ]).astype(np.float32)
-            chunk_np = _refine_for_safety(_s, chunk_np, self._dynamics_model, self._dynamics_stats_t, self._device,
-                                          guidance_scale=self._guidance_scale)
+            _box = (self._safety_x_min, self._safety_x_max,
+                    self._safety_y_min, self._safety_y_max, self._safety_margin)
+            chunk_np = _refine_for_safety(_s, chunk_np, self._dynamics_model, self._dynamics_stats_t,
+                                          self._device, _box, guidance_scale=self._guidance_scale)
         self._action_queue = list(chunk_np)
 
         if self._automaton_model is not None:
