@@ -270,7 +270,7 @@ class DPInferenceNode(Node):
         ip_address = "10.168.4.249"
         self._real_gripper = robotiq.RobotiqGripper(disabled=False)
         self._real_gripper.connect(ip_address, 63352)
-        self._real_gripper.activate(auto_calibrate=True)
+        self._real_gripper.activate(auto_calibrate=False)
         self._real_gripper.open(speed=2, force=2)
 
         self._robot_paused = False
