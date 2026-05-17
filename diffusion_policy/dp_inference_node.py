@@ -4,6 +4,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import json
+import datetime
 import numpy as np
 from typing import Optional
 from collections import deque
@@ -43,7 +45,83 @@ try:
 except ImportError:
     _AUTOMATON_LOADER_AVAILABLE = False
 
+try:
+    from calvin_experiments.train_dynamics_world_model import load_dynamics_model_for_eval as _load_dynamics
+    _DYNAMICS_LOADER_AVAILABLE = True
+except ImportError:
+    _DYNAMICS_LOADER_AVAILABLE = False
+
 from goc_demo import robotiq
+
+# --------------------------------------------------------------------------- #
+#  Dynamics safety guidance (adapted from F_switch_G_safety.ipynb)            #
+# --------------------------------------------------------------------------- #
+
+_DYNAMICS_CKPT = Path(
+    "/home/moritz/src/guided-diffusion/outputs/real_world/dynamics_world_model"
+    "/hd128_depth2_lr0.001_epochs120_2026-05-13_17-53-04/best_model.pt"
+)
+_SAFETY_LOG_DIR = Path("/home/moritz/src/guided-diffusion/outputs/real_world/dynamics_guidance")
+
+# EEF must stay outside x ∈ [SAFETY_X_MIN, SAFETY_X_MAX], y ∈ [SAFETY_Y_MIN, SAFETY_Y_MAX]
+SAFETY_X_MIN, SAFETY_X_MAX = -0.58, -0.55
+SAFETY_Y_MIN, SAFETY_Y_MAX = 0.1, 0.4
+SAFETY_MARGIN = 0.05
+
+
+def _project_rw_dyn_state(s):
+    """Re-orthogonalize rot6d blocks at [3:9] and [13:19] in the 19-dim real-world state."""
+    def _p6(r):
+        a = r[..., :3] / (r[..., :3].norm(dim=-1, keepdim=True) + 1e-8)
+        b = r[..., 3:] - (a * r[..., 3:]).sum(-1, keepdim=True) * a
+        return torch.cat([a, b / (b.norm(dim=-1, keepdim=True) + 1e-8)], dim=-1)
+    return torch.cat([s[..., :3], _p6(s[..., 3:9]), s[..., 9:13], _p6(s[..., 13:19])], dim=-1)
+
+
+def _dynamics_rollout_rw(s0, ac, model, st):
+    if ac.ndim == 2:
+        ac = ac.unsqueeze(0)
+    s = s0.expand(ac.shape[0], -1)
+    states = []
+    for t in range(ac.shape[1]):
+        dn = model((s - st["state_mean"]) / st["state_std"],
+                   (ac[:, t] - st["action_mean"]) / st["action_std"])
+        s = _project_rw_dyn_state(s + dn * st["delta_std"] + st["delta_mean"])
+        states.append(s)
+    return torch.stack(states, dim=1)
+
+
+def _safety_robustness_rw(s0, ac, model, st, tau=0.02):
+    """Smooth-min robustness of G(always outside safety box) over predicted trajectory."""
+    pred_xy = _dynamics_rollout_rw(s0, ac, model, st)[..., 0:2]
+    cx = torch.tensor([(SAFETY_X_MIN + SAFETY_X_MAX) / 2, (SAFETY_Y_MIN + SAFETY_Y_MAX) / 2],
+                      device=pred_xy.device, dtype=pred_xy.dtype)
+    hx = torch.tensor([(SAFETY_X_MAX - SAFETY_X_MIN) / 2, (SAFETY_Y_MAX - SAFETY_Y_MIN) / 2],
+                      device=pred_xy.device, dtype=pred_xy.dtype)
+    q = torch.abs(pred_xy - cx) - hx
+    d = (torch.linalg.norm(torch.clamp(q, min=0.0), dim=-1)
+         + torch.minimum(torch.maximum(q[..., 0], q[..., 1]),
+                         torch.zeros((), device=pred_xy.device, dtype=pred_xy.dtype)))
+    return -tau * torch.logsumexp(-torch.clamp(d, max=SAFETY_MARGIN) / tau, dim=-1)
+
+
+def _refine_for_safety(s_np, ac_np, model, st, device,
+                       guidance_scale=1.0, gradient_steps=20, step_size=0.03,
+                       action_reg=0.05, tau=0.02):
+    """Refine action chunk via gradient ascent on safety robustness (F_switch_G_safety.ipynb)."""
+    s0 = torch.as_tensor(s_np, device=device, dtype=torch.float32).unsqueeze(0)
+    orig = torch.as_tensor(ac_np[None], device=device, dtype=torch.float32)
+    ac = orig.clone().detach().requires_grad_(True)
+    opt = torch.optim.Adam([ac], lr=step_size)
+    for _ in range(gradient_steps):
+        opt.zero_grad(set_to_none=True)
+        obj = (guidance_scale * _safety_robustness_rw(s0, ac, model, st, tau)
+               - action_reg * torch.mean((ac - orig) ** 2, dim=(1, 2)))
+        (-obj.mean()).backward()
+        opt.step()
+        with torch.no_grad():
+            ac.clamp_(-1.0, 1.0)
+    return ac[0].detach().cpu().numpy().astype(np.float32)
 
 
 WORLD_FRAME = "world"
@@ -134,6 +212,7 @@ class DPInferenceNode(Node):
         self.declare_parameter("target_chain", "")  # "idx:maximize;idx:minimize;..."
         self.declare_parameter("wrist_joint_topic", "/joint_states")
         self.declare_parameter("wrist_joint_name", "wrist_3_joint")
+        self.declare_parameter("guidance_scale", 1.0)
 
         self._pose_topic: str = self.get_parameter("pose_topic").value
         self._twist_topic: str = self.get_parameter("twist_topic").value
@@ -147,6 +226,7 @@ class DPInferenceNode(Node):
         self._target_label_idx: int = int(self.get_parameter("target_label_idx").value)
         self._wrist_joint_topic: str = self.get_parameter("wrist_joint_topic").value
         self._wrist_joint_name: str = self.get_parameter("wrist_joint_name").value
+        self._guidance_scale: float = self.get_parameter("guidance_scale").value
         try:
             _chain_raw = self.get_parameter("target_chain").value or ""
             self._target_chain: list = [
@@ -257,6 +337,28 @@ class DPInferenceNode(Node):
         elif not _AUTOMATON_LOADER_AVAILABLE:
             self.get_logger().warn("automaton_model_for_eval not importable; no automaton guidance.")
 
+        # --- Load dynamics world model for safety guidance ---
+        self._dynamics_model = None
+        self._dynamics_stats_t = None
+        if _DYNAMICS_LOADER_AVAILABLE:
+            try:
+                dyn_model, dyn_stats, _, _ = _load_dynamics(_DYNAMICS_CKPT, device=device)
+                self._dynamics_model = dyn_model
+                self._dynamics_stats_t = {
+                    k: torch.as_tensor(v, device=device, dtype=torch.float32).unsqueeze(0)
+                    for k, v in dyn_stats.items()
+                }
+                self.get_logger().info(f"Dynamics model loaded: {_DYNAMICS_CKPT}")
+            except Exception as e:
+                self.get_logger().error(f"Failed to load dynamics model: {e}")
+
+        # --- Rollout log ---
+        _SAFETY_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        _log_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._rollout_log_path = _SAFETY_LOG_DIR / f"rollout_{_log_ts}.jsonl"
+        self._rollout_log_file = open(self._rollout_log_path, "w")
+        self.get_logger().info(f"Rollout log: {self._rollout_log_path}")
+
         # --- Timer ---
         self._timer = self.create_timer(1.0 / self._rate_hz, self._on_timer)
         self.get_logger().info(f"DP inference node running at {self._rate_hz:.1f} Hz")
@@ -326,6 +428,11 @@ class DPInferenceNode(Node):
             "cheezit_pos":    cheezit_pos,
             "cheezit_rot6d":  cheezit_rot6d,
         }
+        self._rollout_log_file.write(json.dumps({
+            "t_ns": self.get_clock().now().nanoseconds,
+            "eef_xyz": eef_pos.tolist(),
+        }) + "\n")
+        self._rollout_log_file.flush()
         self._obs_deque.append(step_obs)
 
         # Pad deque with repeated first observation until full
@@ -459,7 +566,15 @@ class DPInferenceNode(Node):
         # _gripper_hist = "  ".join(f"{v:.4f}" for v in self._gripper_raw_history)
         # self.get_logger().info(f"\n\nstacked_obs:\n{_obs_lines}\n  gripper_raw (last 2): {_gripper_hist}\n\n")
 
-        self._action_queue = list(action_chunks[selected_idx])  # list of H arrays, each shape (A,)
+        chunk_np = action_chunks[selected_idx]  # (H, A) unnormalized
+        if self._dynamics_model is not None:
+            _s = np.concatenate([
+                step_obs["eef_pos"], step_obs["eef_rot6d"],
+                step_obs["gripper_binary"], step_obs["cheezit_pos"], step_obs["cheezit_rot6d"],
+            ]).astype(np.float32)
+            chunk_np = _refine_for_safety(_s, chunk_np, self._dynamics_model, self._dynamics_stats_t, self._device,
+                                          guidance_scale=self._guidance_scale)
+        self._action_queue = list(chunk_np)
 
         if self._automaton_model is not None:
             label_names = self._automaton_meta["label_names"]

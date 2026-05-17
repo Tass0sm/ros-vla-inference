@@ -33,7 +33,15 @@ Then, go to rviz, add an InteractiveMarkerNode, set its topic to
 
 #+begin_src shell
 source ./trackers-venv/bin/activate
-ros2 run diffusion_policy dp_inference_node --ros-args \
-    -p ckpt_path:=/path/to/model.pth \
+PYTHONPATH=/home/moritz/src/guided-diffusion/robomimic:$PYTHONPATH \
+    ros2 run diffusion_policy dp_inference_node --ros-args \
     -p obj_pose_topic:=/cheezit/pose
+
+PYTHONPATH=/home/moritz/src/guided-diffusion/robomimic:$PYTHONPATH \
+    ros2 run diffusion_policy dp_inference_node --ros-args \
+    -p ckpt_path:=/home/shared/models/real_world/cheezit_dp_20260513170400/model_epoch_160.pth \
+    -p obj_pose_topic:=/cheezit/pose \
+    -p preview_chunks:=false \
+    -p n_candidates:=16 \
+    -p 'target_chain:=0:maximize;2:maximize;2:minimize;0:minimize'
 #+end_src
