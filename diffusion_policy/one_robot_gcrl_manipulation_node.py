@@ -180,7 +180,7 @@ class OneRobotGCRLManipulationNode(Node):
             frame_stack=3,  # Number of frames to stack.
         )
 
-        with open("/home/tassos/phd/software/ros_workspaces/test_ws/src/diffusion_policy/data/processed_dataset.pkl", "rb") as f:
+        with open("/home/tassos/phd/software/ros_workspaces/test_ws/src/diffusion_policy/data/processed_dataset_v3.pkl", "rb") as f:
             train_dataset = pickle.load(f)
 
         self._action_min = train_dataset.pop("action_min", None)
@@ -204,7 +204,7 @@ class OneRobotGCRLManipulationNode(Node):
         )
         self.agent = restore_agent(
             agent,
-            "/home/tassos/phd/software/ros_workspaces/test_ws/src/real_world_checkpoints/h_flow_hjb_gcivl/version2",
+            "/home/tassos/phd/software/ros_workspaces/test_ws/src/real_world_checkpoints/h_flow_hjb_gcivl/version3",
             "200000"
         )
 
@@ -259,9 +259,9 @@ class OneRobotGCRLManipulationNode(Node):
         self._latest_image = resized_img
 
     def _extract_state(self,
-                       q: np.ndarray, qd: np.ndarray, eff: np.ndarray, 
+                       q: np.ndarray, # qd: np.ndarray, eff: np.ndarray, 
                        pose: Pose,
-                       twist: Twist,
+                       # twist: Twist,
                        gripper_pos: int) -> Tuple[np.ndarray, np.ndarray]:
 
         # Only using cartesian position
@@ -270,15 +270,15 @@ class OneRobotGCRLManipulationNode(Node):
                              pose.position.y,
                              pose.position.z])
 
-        def twist_to_arr(twist: Twist):
-            return np.array([twist.linear.x,
-                             twist.linear.y,
-                             twist.linear.z])
+        # def twist_to_arr(twist: Twist):
+        #     return np.array([twist.linear.x,
+        #                      twist.linear.y,
+        #                      twist.linear.z])
 
-        x = np.concatenate([q, qd, eff,
+        x = np.concatenate([q, # qd, eff,
                             pose_to_arr(pose),
-                            np.array([0.0, 0.0, 1.0, 0.0]),
-                            twist_to_arr(twist),
+                            # np.array([0.0, 0.0, 1.0, 0.0]),
+                            # twist_to_arr(twist),
                             np.array([gripper_pos], dtype=float)])
 
         return x
@@ -318,10 +318,10 @@ class OneRobotGCRLManipulationNode(Node):
             assert len(self._obs_deque) == 3, "Need three latest observations. Skipping."
             observation = np.concatenate(self._obs_deque, axis=-1)
             proprioception = self._extract_state(self._latest_q,
-                                                 self._latest_qd,
-                                                 self._latest_eff,
+                                                 # self._latest_qd,
+                                                 # self._latest_eff,
                                                  self._latest_pose,
-                                                 self._latest_twist,
+                                                 # self._latest_twist,
                                                  self._real_gripper.get_current_position())
         except Exception as e:
             self.get_logger().warn(f"Bad State: {e}")
