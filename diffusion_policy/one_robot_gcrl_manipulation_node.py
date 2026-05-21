@@ -89,6 +89,10 @@ class OneRobotGCRLManipulationNode(Node):
         self.declare_parameter("checkpoint_path", "")
         self.declare_parameter("checkpoint_epoch", "")
         self.declare_parameter("obj_name", "")
+        # Semicolon-separated key=value overrides, e.g. 'frame_stack=3;encoder=impala_small'.
+        # Applied after loading the agent config file, mirroring --agent.key=value in training.
+        # This format avoids YAML-special characters so it works unquoted on the ros2 CLI.
+        self.declare_parameter("agent_config_overrides", "")
 
         self.bridge = CvBridge()
         self._target_img_dim = None  # set from dataset after loading
@@ -178,8 +182,32 @@ class OneRobotGCRLManipulationNode(Node):
 
         config = _load_agent_config(agent_config_path)
 
+        # Apply overrides passed as a ROS parameter using semicolon-separated key=value pairs, e.g.:
+        #   agent_config_overrides: 'frame_stack=3;encoder=impala_small;p_aug=0.5'
+        # Values are parsed as Python literals (int, float, bool, str) via ast.literal_eval,
+        # falling back to plain strings. This format avoids YAML-special characters so it
+        # works unquoted on the ros2 CLI (-p agent_config_overrides:='frame_stack=3;...').
+        overrides_str: str = self.get_parameter("agent_config_overrides").value
+        if overrides_str:
+            import ast
+            overrides = {}
+            for pair in overrides_str.split(";"):
+                pair = pair.strip()
+                if not pair:
+                    continue
+                key, _, val_str = pair.partition("=")
+                key = key.strip()
+                val_str = val_str.strip()
+                try:
+                    val = ast.literal_eval(val_str)
+                except (ValueError, SyntaxError):
+                    val = val_str  # treat as plain string
+                overrides[key] = val
+            config.update(overrides)
+            self.get_logger().info(f"Applied agent_config_overrides: {overrides}")
+
         self._obs_mode = "image" if "Pixel" in config['dataset_class'] else "proprio"
-        frame_stack = config.get('frame_stack', 1)
+        frame_stack = config.get('frame_stack') or 1  # config may store None; default to 1
         self.get_logger().info(f"obs_mode={self._obs_mode!r}, frame_stack={frame_stack}")
 
         if self._obs_mode == "image":
