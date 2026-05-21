@@ -35,7 +35,7 @@ from tf2_ros import (
     ExtrapolationException
 )
 from tf2_geometry_msgs import do_transform_pose_stamped, do_transform_point
-from tf_transformations import quaternion_matrix
+from tf_transformations import quaternion_matrix, euler_from_quaternion, quaternion_from_euler
 
 from pydrake.math import RollPitchYaw
 from pydrake.common.eigen_geometry import Quaternion
@@ -44,13 +44,30 @@ from pydrake.common.eigen_geometry import Quaternion
 # from goc_mpc.goc_mpc import GraphOfConstraints, GraphOfConstraintsMPC
 # from goc_mpc.simple_drake_env import SimpleDrakeGym
 
+import importlib.util
+
 import jax
 
-from agents.pixel_agents.h_flow_hjb_gcivl import H_Flow_HJB_GCIVL_PixelAgent
+from agents import agents as agent_registry
 from utils.flax_utils import restore_agent
-from utils.datasets import Dataset, PixelHGCDataset
+from utils.datasets import Dataset, GCDataset, HGCDataset, PixelHGCDataset, SequenceGCDataset
 
 from goc_demo import robotiq
+
+DATASET_CLASS_DICT = {
+    'GCDataset':       GCDataset,
+    'HGCDataset':      HGCDataset,
+    'PixelHGCDataset': PixelHGCDataset,
+    'SequenceGCDataset': SequenceGCDataset,
+}
+
+
+def _load_agent_config(config_path: str):
+    """Import a GCRLManipulation agent config file and return its ConfigDict."""
+    spec = importlib.util.spec_from_file_location("_agent_cfg", config_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.get_config()
 
 
 WORLD_FRAME = "world"
@@ -67,9 +84,14 @@ class OneRobotGCRLManipulationNode(Node):
         self.declare_parameter("pose_topic", "/cartesian_motion_controller/current_pose")
         self.declare_parameter("twist_topic", "/cartesian_motion_controller/current_twist")
         self.declare_parameter("rate_hz", 30.0)
+        self.declare_parameter("agent_config_path", "")
+        self.declare_parameter("dataset_path", "")
+        self.declare_parameter("checkpoint_path", "")
+        self.declare_parameter("checkpoint_epoch", "")
+        self.declare_parameter("obj_name", "")
 
         self.bridge = CvBridge()
-        self._target_img_dim = 128
+        self._target_img_dim = None  # set from dataset after loading
 
         # Read params
         self._pose_topic: str = self.get_parameter("pose_topic").value
@@ -114,8 +136,14 @@ class OneRobotGCRLManipulationNode(Node):
         self.create_subscription(JointState, "/joint_states", self._on_joints, pose_qos)
 
         self._latest_image = None
-        self._obs_deque = deque(maxlen=3)
-        self.create_subscription(Image, '/camera/camera/color/image_raw', self._on_image, 10)
+        self._obs_deque = None  # initialized after config load; subscription created conditionally
+
+        self._latest_obj_pose: Optional[PoseStamped] = None
+        self._obj_name: str = self.get_parameter("obj_name").value
+        if self._obj_name:
+            self.create_subscription(
+                PoseStamped, f"{self._obj_name}/center_pose", self._on_obj_pose, pose_qos
+            )
 
         # Publisher to send the target pose to the robot
         target_pose_topic_name = "/cartesian_motion_controller/target_frame"
@@ -136,77 +164,82 @@ class OneRobotGCRLManipulationNode(Node):
 
         # Pending gripper cmds (latched until pre-delay expires)
         self._pending_gripper_cmd = None
+        self._last_commanded_gripper: float = -1.0  # -1 = open, +1 = closed
 
         # Tunables
         self._grasp_settle_sec = 1.00          # wait before actuating gripper
         self._grasp_pause_after_cmd_sec = 1.00 # time to remain paused after actuation
 
-        # Initialize agent.
-        config = dict(
-            # Agent hyperparameters.
-            agent_name='h_flow_hjb_gcivl_pixel',  # Agent name.
-            lr=3e-4,  # Learning rate.
-            batch_size=256,  # Batch size.
-            actor_hidden_dims=(1024, 1024, 1024, 1024),  # Actor network hidden dimensions.
-            value_hidden_dims=(1024, 1024, 1024, 1024),  # Value network hidden dimensions.
-            expectile=0.9,  # IQL expectile.
-            alpha=10.0,  # Temperature in AWR or BC coefficient.
-            layer_norm=True,  # Whether to use layer normalization.
-            const_std=True,  # Whether to use constant standard deviation for the actor.
-            discount=0.999,  # Discount factor.
-            # low_discount=ml_collections.config_dict.placeholder(float),  # Low-level discount (set automatically).
-            tau=0.005,  # Target network update rate.
-            q_agg='min',  # Aggregation function for Q values.
-            # action_dim=ml_collections.config_dict.placeholder(int),  # Action dimension (set automatically).
-            # goal_dim=ml_collections.config_dict.placeholder(tuple),  # Goal dimension (set automatically).
-            # subgoal_dim=ml_collections.config_dict.placeholder(int),  # Goal dimension (set automatically).
-            value_loss_type='bce',  # Value loss type ('squared' or 'bce').
-            flow_steps=10,  # Number of flow steps.
-            num_samples=32,  # Number of samples for the actor.
-            encoder="impala_small",  # Visual encoder name (None, 'impala_small', etc.).
-            # Dataset hyperparameters.
-            dataset_class='PixelHGCDataset',  # Dataset class name.
-            subgoal_steps=10,  # Subgoal steps.
-            value_p_curgoal=0.2,  # Probability of using the current state as the value goal.
-            value_p_trajgoal=0.5,  # Probability of using a future state in the same trajectory as the value goal.
-            value_p_randomgoal=0.3,  # Probability of using a random state as the value goal.
-            value_geom_sample=False,  # Whether to use geometric sampling for future value goals.
-            actor_p_curgoal=0.0,  # Probability of using the current state as the actor goal.
-            actor_p_trajgoal=1.0,  # Probability of using a future state in the same trajectory as the actor goal.
-            actor_p_randomgoal=0.0,  # Probability of using a random state as the actor goal.
-            actor_geom_sample=True,  # Whether to use geometric sampling for future actor goals.
-            gc_negative=False,  # Whether to use '0 if s == g else -1' (True) or '1 if s == g else 0' (False) as reward.
-            p_aug=0.5,  # Probability of applying image augmentation.
-            frame_stack=3,  # Number of frames to stack.
-        )
+        # Initialize agent from ROS parameters.
+        agent_config_path: str = self.get_parameter("agent_config_path").value
+        dataset_path: str = self.get_parameter("dataset_path").value
+        checkpoint_path: str = self.get_parameter("checkpoint_path").value
+        checkpoint_epoch: str = self.get_parameter("checkpoint_epoch").value
 
-        with open("/home/tassos/phd/software/ros_workspaces/test_ws/src/diffusion_policy/data/processed_dataset_v3.pkl", "rb") as f:
+        config = _load_agent_config(agent_config_path)
+
+        self._obs_mode = "image" if "Pixel" in config['dataset_class'] else "proprio"
+        frame_stack = config.get('frame_stack', 1)
+        self.get_logger().info(f"obs_mode={self._obs_mode!r}, frame_stack={frame_stack}")
+
+        if self._obs_mode == "image":
+            self._obs_deque = deque(maxlen=frame_stack)
+            self.create_subscription(Image, '/camera/camera/color/image_raw', self._on_image, 10)
+
+        with open(dataset_path, "rb") as f:
             train_dataset = pickle.load(f)
 
+        train_dataset.pop("ee_scale", None)
         self._action_min = train_dataset.pop("action_min", None)
         self._action_max = train_dataset.pop("action_max", None)
         self._action_norm = train_dataset.pop("actions_norm", None)
 
+        if self._obs_mode == "image":
+            self._target_img_dim = train_dataset["observations"].shape[1]
+            self.get_logger().info(f"Image size from dataset: {self._target_img_dim}x{self._target_img_dim}")
+        else:
+            self._target_img_dim = None
+
+        # action_min/max cover only the movement dims (gripper is not normalized).
+        # shape (3,) : XYZ only
+        # shape (4,) : XYZ + yaw.
+        self._needs_yaw = (self._action_min is not None and self._action_min.shape[0] == 4)
+        self.get_logger().info(
+            f"Action mode: {'XYZ + yaw' if self._needs_yaw else 'XYZ only'} "
+            f"(action_min dim = {self._action_min.shape[0] if self._action_min is not None else 'unknown'})"
+        )
+
         train_dataset['terminals'][-1] = 1.0
 
-        train_dataset = PixelHGCDataset(Dataset.create(**train_dataset), config)
+        dataset_class = DATASET_CLASS_DICT[config['dataset_class']]
+        train_dataset = dataset_class(Dataset.create(**train_dataset), config)
 
         goal_index = np.argwhere(train_dataset.dataset["terminals"])[0].item()
-        self._goal_obs = np.expand_dims(train_dataset.dataset["observations"][goal_index], 0)
+        goal_obs = train_dataset.dataset["observations"][goal_index]
+        if self._obs_mode == "image" and frame_stack > 1:
+            goal_obs = np.concatenate([goal_obs] * frame_stack, axis=-1)
+        self._goal_obs = goal_obs # np.expand_dims(goal_obs, 0)
 
         example_batch = train_dataset.sample(1)
 
-        agent = H_Flow_HJB_GCIVL_PixelAgent.create(
-            0,
-            example_batch,
-            config,
-            "real_world_experiment",
-        )
-        self.agent = restore_agent(
-            agent,
-            "/home/tassos/phd/software/ros_workspaces/test_ws/src/real_world_checkpoints/h_flow_hjb_gcivl/version3",
-            "200000"
-        )
+        agent_name = config['agent_name']
+        agent_class = agent_registry[agent_name]
+
+        if agent_name in ["gcfbc", "gcfql"]:
+            agent = agent_class.create(
+                0,
+                example_batch,
+                config,
+            )
+        else:
+            agent = agent_class.create(
+                0,
+                example_batch,
+                config,
+                "real_world_experiment",
+            )
+
+        self.agent = restore_agent(agent, checkpoint_path, checkpoint_epoch)
 
         # --- Timing ---
         self._start_time = self.get_clock().now()
@@ -239,6 +272,11 @@ class OneRobotGCRLManipulationNode(Node):
         if tw is not None:
             self._latest_twist = tw
 
+    def _on_obj_pose(self, msg: PoseStamped):
+        ps_w = self._to_world(msg)
+        if ps_w is not None:
+            self._latest_obj_pose = ps_w.pose
+
     def _on_image(self, msg):
         # 1. Convert ROS Image message to OpenCV format
         cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
@@ -264,24 +302,28 @@ class OneRobotGCRLManipulationNode(Node):
                        # twist: Twist,
                        gripper_pos: int) -> Tuple[np.ndarray, np.ndarray]:
 
-        # Only using cartesian position
         def pose_to_arr(pose: Pose):
-            return np.array([pose.position.x,
-                             pose.position.y,
-                             pose.position.z])
+            arr = np.array([pose.position.x,
+                            pose.position.y,
+                            pose.position.z])
+            if self._needs_yaw:
+                arr = np.append(arr, self._quat_to_yaw(pose.orientation))
+            return arr
 
         # def twist_to_arr(twist: Twist):
         #     return np.array([twist.linear.x,
         #                      twist.linear.y,
         #                      twist.linear.z])
 
-        x = np.concatenate([q, # qd, eff,
-                            pose_to_arr(pose),
-                            # np.array([0.0, 0.0, 1.0, 0.0]),
-                            # twist_to_arr(twist),
-                            np.array([gripper_pos], dtype=float)])
+        parts = [# q, qd, eff,
+                 pose_to_arr(pose),
+                 # twist_to_arr(twist),
+                 np.array([gripper_pos], dtype=float)]
 
-        return x
+        if self._latest_obj_pose is not None:
+            parts.append(pose_to_arr(self._latest_obj_pose))
+
+        return np.concatenate(parts)
 
     def _on_timer(self):
         if self._latest_pose is None:
@@ -301,8 +343,12 @@ class OneRobotGCRLManipulationNode(Node):
             self.get_logger().info('_latest_eff is None')
             return
 
-        if self._latest_image is None:
+        if self._obs_mode == "image" and self._latest_image is None:
             self.get_logger().info('_latest_image is None')
+            return
+
+        if self._obj_name and self._latest_obj_pose is None:
+            self.get_logger().info('_latest_obj_pose is None')
             return
 
         now = self.get_clock().now()
@@ -312,17 +358,20 @@ class OneRobotGCRLManipulationNode(Node):
         #                           GET OBSERVATION                           #
         #######################################################################
 
-
         try:
-            self._obs_deque.append(self._latest_image)
-            assert len(self._obs_deque) == 3, "Need three latest observations. Skipping."
-            observation = np.concatenate(self._obs_deque, axis=-1)
             proprioception = self._extract_state(self._latest_q,
                                                  # self._latest_qd,
                                                  # self._latest_eff,
                                                  self._latest_pose,
                                                  # self._latest_twist,
                                                  self._real_gripper.get_current_position())
+            if self._obs_mode == "image":
+                self._obs_deque.append(self._latest_image)
+                fs = self._obs_deque.maxlen
+                assert len(self._obs_deque) == fs, f"Need {fs} latest observations. Skipping."
+                observation = np.concatenate(list(self._obs_deque), axis=-1)
+            else:
+                observation = proprioception
         except Exception as e:
             self.get_logger().warn(f"Bad State: {e}")
             return
@@ -331,21 +380,34 @@ class OneRobotGCRLManipulationNode(Node):
         #                             AGENT STEP                              #
         #######################################################################
 
-        action_norm = self.agent.sample_actions(observation, proprioception,
-                                                goals=self._goal_obs, seed=jax.random.PRNGKey(0))
+        if self._obs_mode == "image":
+            action_norm = self.agent.sample_actions(observation, proprioception,
+                                                    goals=self._goal_obs, seed=jax.random.PRNGKey(0))
+        else:
+            action_norm = self.agent.sample_actions(observation,
+                                                    goals=self._goal_obs, seed=jax.random.PRNGKey(0))
         action_norm = np.asarray(action_norm)
-        delta_norm = action_norm[:3]
+
+        if self._needs_yaw:
+            delta_norm    = action_norm[:4]   # [dx, dy, dz, dyaw]  — all normalized
+            gripper_target = action_norm[4:]  # [gripper]
+        else:
+            delta_norm    = action_norm[:3]   # [dx, dy, dz]
+            gripper_target = action_norm[3:]  # [gripper]
+
         delta = self._denormalize_actions(delta_norm)
 
-        # action is left pose delta in world frame. latest_left_pose is in world frame
-        target = delta + np.array([self._latest_pose.position.x,
-                                   self._latest_pose.position.y,
-                                   self._latest_pose.position.z])
-        gripper_target = action_norm[3:] # just [-1.0] or [1.0]
+        target_xyz = delta[:3] + np.array([self._latest_pose.position.x,
+                                           self._latest_pose.position.y,
+                                           self._latest_pose.position.z])
 
-        self.get_logger().info(f"delta: {delta}, gripper: {gripper_target}")
-
-        action = np.concatenate((target, gripper_target), axis=-1)
+        if self._needs_yaw:
+            current_yaw = self._quat_to_yaw(self._latest_pose.orientation)
+            target_yaw  = delta[3] + current_yaw
+            self.get_logger().info(f"delta_xyz: {delta_norm[:3]}, delta_yaw: {delta_norm[3]:.3f}, gripper: {gripper_target}")
+            # self.get_logger().info(f"delta_xyz: {delta[:3]}, delta_yaw: {delta[3]:.3f}, gripper: {gripper_target}")
+        else:
+            self.get_logger().info(f"delta: {delta_norm}, gripper: {gripper_target}")
 
         #######################################################################
         #                            EXECUTE ACTION                           #
@@ -354,13 +416,21 @@ class OneRobotGCRLManipulationNode(Node):
         target_pose_stamped = PoseStamped()
         target_pose_stamped.header.frame_id = WORLD_FRAME
         target_pose_stamped.header.stamp = self.get_clock().now().to_msg()
-        target_pose_stamped.pose.position.x = action[0]
-        target_pose_stamped.pose.position.y = action[1]
-        target_pose_stamped.pose.position.z = action[2]
-        target_pose_stamped.pose.orientation.w = 0.0
-        target_pose_stamped.pose.orientation.x = 0.0
-        target_pose_stamped.pose.orientation.y = 1.0
-        target_pose_stamped.pose.orientation.z = 0.0
+        target_pose_stamped.pose.position.x = float(target_xyz[0])
+        target_pose_stamped.pose.position.y = float(target_xyz[1])
+        target_pose_stamped.pose.position.z = float(target_xyz[2])
+
+        if self._needs_yaw:
+            qw, qx, qy, qz = self._yaw_to_quat(target_yaw)
+            target_pose_stamped.pose.orientation.w = qw
+            target_pose_stamped.pose.orientation.x = qx
+            target_pose_stamped.pose.orientation.y = qy
+            target_pose_stamped.pose.orientation.z = qz
+        else:
+            target_pose_stamped.pose.orientation.w = 0.0
+            target_pose_stamped.pose.orientation.x = 0.0
+            target_pose_stamped.pose.orientation.y = 1.0
+            target_pose_stamped.pose.orientation.z = 0.0
 
         # qpos = np.concatenate((left_target_pose, right_target_pose))
         # self._obs, _, _, _, _ = self._env.step(qpos, grasp_cmds=self.goc_mpc.last_grasp_commands)
@@ -401,7 +471,36 @@ class OneRobotGCRLManipulationNode(Node):
         if not self._robot_paused and target_pose_stamped is not None:
             self.target_pose_publisher.publish(target_pose_stamped)
 
+            next_gripper = float(gripper_target[0])
+            prev = self._last_commanded_gripper
+            if next_gripper > 0.0 and prev <= 0.0:
+                self.get_logger().info("Closing gripper.")
+                self._last_commanded_gripper = 1.0
+                self._pause_robot_delayed(
+                    pre_delay=self._grasp_settle_sec,
+                    post_delay=self._grasp_pause_after_cmd_sec,
+                    gripper_cmd="close",
+                )
+            elif next_gripper <= 0.0 and prev > 0.0:
+                self.get_logger().info("Opening gripper.")
+                self._last_commanded_gripper = -1.0
+                self._pause_robot_delayed(
+                    pre_delay=0.0,
+                    post_delay=0.0,
+                    gripper_cmd="open",
+                )
+
     # --- Helpers ---
+
+    def _quat_to_yaw(self, quat) -> float:
+        """Extract yaw (rotation about world Z) from a geometry_msgs Quaternion."""
+        _, _, yaw = euler_from_quaternion([quat.x, quat.y, quat.z, quat.w])
+        return yaw
+
+    def _yaw_to_quat(self, yaw: float):
+        """Convert yaw angle to (w, x, y, z) with the fixed roll/pitch used by the robot."""
+        qx, qy, qz, qw = quaternion_from_euler(-np.pi, 0.0, yaw)
+        return (qw, qx, qy, qz)
 
     def _publish_paths(self, left_path_pub, left_xi, right_path_pub, right_xi, pos_only=True):
         left_path_msg = Path()
@@ -453,17 +552,16 @@ class OneRobotGCRLManipulationNode(Node):
         right_path_pub.publish(right_path_msg)
 
 
-    def _do_gripper_cmd(self, side: str, cmd: str):
+    def _do_gripper_cmd(self, cmd: str):
         try:
-            gr = self.left_real_gripper if side == 'left' else self.right_real_gripper
-            if cmd == 'grab':
-                gr.close(speed=200, force=2)
-            elif cmd == 'release':
-                gr.open(speed=200, force=2)
+            if cmd == "close":
+                self._real_gripper.close(speed=200, force=2)
+            elif cmd == "open":
+                self._real_gripper.open(speed=200, force=2)
             else:
                 self.get_logger().warn(f"Unknown gripper cmd: {cmd}")
         except Exception as e:
-            self.get_logger().error(f"Gripper {side} command '{cmd}' failed: {e}")
+            self.get_logger().error(f"Gripper command '{cmd}' failed: {e}")
 
     def _resume_robot(self):
         self._robot_paused = False
@@ -472,22 +570,6 @@ class OneRobotGCRLManipulationNode(Node):
             self._resume_timer = None
         self.get_logger().info("robot resumed after grasp pause.")
 
-    def _on_left_pre_grasp(self):
-        """Fires after settle delay: actuate gripper then start resume timer."""
-        if self._left_pre_grasp_timer is not None:
-            self._left_pre_grasp_timer.cancel()
-            self._left_pre_grasp_timer = None
-        cmd = self._left_pending_gripper_cmd
-        self._left_pending_gripper_cmd = None
-        if cmd is not None:
-            self._do_gripper_cmd('left', cmd)
-        # chain the resume one-shot
-        if self._left_resume_timer is not None:
-            self._left_resume_timer.cancel()
-            self._left_resume_timer = None
-        self._left_resume_timer = self.create_timer(self._grasp_pause_after_cmd_sec,
-                                                    self._resume_robot_left)
-
     def _on_pre_grasp(self):
         if self._pre_grasp_timer is not None:
             self._pre_grasp_timer.cancel()
@@ -495,7 +577,7 @@ class OneRobotGCRLManipulationNode(Node):
         cmd = self._pending_gripper_cmd
         self._pending_gripper_cmd = None
         if cmd is not None:
-            self._do_gripper_cmd('right', cmd)
+            self._do_gripper_cmd(cmd)
         if self._resume_timer is not None:
             self._resume_timer.cancel()
             self._resume_timer = None
