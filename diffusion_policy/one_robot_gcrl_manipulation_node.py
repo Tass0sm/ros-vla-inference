@@ -244,9 +244,7 @@ class OneRobotGCRLManipulationNode(Node):
 
         goal_index = np.argwhere(train_dataset.dataset["terminals"])[0].item()
         goal_obs = train_dataset.dataset["observations"][goal_index]
-        if self._obs_mode == "image" and frame_stack > 1:
-            goal_obs = np.concatenate([goal_obs] * frame_stack, axis=-1)
-        self._goal_obs = goal_obs # np.expand_dims(goal_obs, 0)
+        self._goal_obs = goal_obs
 
         example_batch = train_dataset.sample(1)
 
@@ -348,7 +346,7 @@ class OneRobotGCRLManipulationNode(Node):
                  # twist_to_arr(twist),
                  np.array([gripper_pos], dtype=float)]
 
-        if self._latest_obj_pose is not None:
+        if self._latest_obj_pose is not None and self._obs_mode != "image":
             parts.append(pose_to_arr(self._latest_obj_pose))
 
         return np.concatenate(parts)
