@@ -16,7 +16,8 @@ from PIL import Image
 # ============================================================
 
 input_folder = Path("/home/tassos/phd/software/ros_workspaces/test_ws/saved_data/pick_and_place_spam")
-output_file = Path("processed_dataset_state_based_v8.pkl")
+output_file = Path("processed_dataset_state_based_v12.pkl")
+# output_file = Path("processed_dataset_image_based_v5.pkl")
 
 # "image"  — observations are camera frames (H×W×C)
 # "proprio" — observations are the proprioception vector (no images loaded)
@@ -54,10 +55,68 @@ ZERO_PAUSE_ACTIONS      = False
 SPLICE_PAUSE_WITH_EE    = False
 SCALE_EE_TO_MPC         = True
 
+# If True, relabel next_gripper_pos for every step inside a gripper pause
+# window so that it always predicts the POST-transition state.
+#
+# Without this, the pause window (settle + resume ≈ 20 steps) has only one
+# step that carries the "transition" gripper label (the step immediately
+# before the physical transition), while all other window steps say "hold
+# current state" — a 19:1 imbalance that teaches the policy never to
+# change gripper state.  Relabeling gives the policy a consistent signal:
+# "whenever you are in this window, initiate the gripper change."
+# Compatible with all four action modes above.
+RELABEL_PAUSE_GRIPPER = True
+
+# Controls how far *before* the physical gripper transition the relabeling
+# reaches back into the settle window.
+#
+#   0.0 — resume-only (default): relabel starts exactly at the transition
+#         step; the settle window keeps its natural (hold-current) label.
+#         Prevents the policy from triggering the gripper early.
+#
+#   1.0 — full window: relabel covers the entire settle window too
+#         (original v9 behaviour).  Fixes the 19:1 imbalance fully but
+#         causes the policy to fire ~GRASP_SETTLE_SEC too early.
+#
+#   0.5 — halfway: relabel starts halfway through the settle window.
+#         A reasonable compromise if the policy still misses some grasps
+#         with 0.0.
+#
+# Has no effect when RELABEL_PAUSE_GRIPPER = False.
+RELABEL_SETTLE_FRACTION = 0.3
+
+# If True, remove every step inside a gripper pause window from the dataset
+# entirely.  The robot is physically stationary during these windows (EE does
+# not move), so with SCALE_EE_TO_MPC the actions are near-zero for
+# settle_steps + resume_steps ≈ 20 consecutive steps at the exact grasp /
+# release location.  The policy over-learns "stay here" and gets stuck.
+#
+# Trimming removes those steps so the dataset jumps directly from the last
+# approaching step to the first departing step.  The controller still handles
+# the physical gripper close/open timing; the policy does not need to dwell.
+#
+# When used together with RELABEL_PAUSE_GRIPPER (recommended), the relabeling
+# acts on the trimmed sequence: the transition appears as a single-step jump,
+# and RELABEL_SETTLE_FRACTION controls how many approach steps before the jump
+# are relabeled to "initiate gripper change" (e.g. 0.3 → 3 steps).
+TRIM_PAUSE_WINDOWS = False
+
 RATE_HZ            = 10.0          # recording rate used during collection
 GRASP_SETTLE_SEC   = 1.0           # _grasp_settle_sec in the demo node
 GRASP_RESUME_SEC   = 1.0           # _grasp_pause_after_cmd_sec in the demo node
 GRIPPER_OPEN_MAX   = 20            # gripper_pos values ≤ this are "open"
+
+# Gripper normalization for proprioception.
+# The raw gripper_pos (an integer 0–~200) is mapped to [-1, +1] before being
+# stored in the observation vector, consistent with the ±1 action convention
+# (+1 = closed, -1 = open).  Values outside [MIN, MAX] are clipped to ±1.
+# Only affects the observation; all internal logic (pause masks, action labels)
+# still uses the raw value.
+#
+# NOTE: the ROS deployment node must apply the same normalization when
+# constructing observations so the policy sees the same scale it trained on.
+GRIPPER_PROP_MIN   = 0.0           # raw gripper_pos mapped to -1 (fully open)
+GRIPPER_PROP_MAX   = 200.0         # raw gripper_pos mapped to +1 (fully closed)
 
 # ============================================================
 # HELPERS
@@ -138,6 +197,42 @@ def scale_ee_to_mpc(ee_deltas: np.ndarray, scale: np.ndarray) -> np.ndarray:
     return ee_deltas * scale
 
 
+def relabel_pause_gripper(gripper_binarized: np.ndarray,
+                          gripper_pos_raw: np.ndarray) -> np.ndarray:
+    """Compute next_gripper_pos with pause-window relabeling.
+
+    Steps inside a gripper pause window are relabeled to predict the
+    POST-transition gripper state.  The window that is relabeled spans:
+
+        [t - floor(RELABEL_SETTLE_FRACTION * settle_steps),
+         t + resume_steps]
+
+    where t is the first step of the new gripper state.
+
+    RELABEL_SETTLE_FRACTION = 0.0  → resume half only (starts at t)
+    RELABEL_SETTLE_FRACTION = 1.0  → full window (settle + resume)
+
+    Resume-only (0.0) prevents the policy from triggering early; the full
+    window (1.0) fixes a larger class imbalance at the cost of the policy
+    learning to fire GRASP_SETTLE_SEC steps prematurely.
+    """
+    next_g       = np.pad(gripper_binarized[1:], (0, 1), mode='edge').copy()
+    is_closed    = gripper_pos_raw > GRIPPER_OPEN_MAX
+    settle_steps = int(round(GRASP_SETTLE_SEC * RATE_HZ))
+    resume_steps = int(round(GRASP_RESUME_SEC * RATE_HZ))
+    back_steps   = int(round(RELABEL_SETTLE_FRACTION * settle_steps))
+    T            = len(gripper_pos_raw)
+
+    for t in range(1, T):
+        if is_closed[t] != is_closed[t - 1]:
+            target = +1.0 if is_closed[t] else -1.0   # post-transition state
+            lo = max(0,     t - back_steps)
+            hi = min(T - 1, t + resume_steps)
+            next_g[lo : hi + 1] = target
+
+    return next_g
+
+
 def filter_termination_segments(termination):
     keep = np.zeros(len(termination), dtype=bool)
     prev = 0
@@ -150,6 +245,18 @@ def filter_termination_segments(termination):
         prev = t
 
     return keep
+
+
+def apply_trim(keep: np.ndarray, data: dict) -> np.ndarray:
+    """AND keep with ~pause_mask when TRIM_PAUSE_WINDOWS is True.
+
+    The pause mask is computed on the raw (un-filtered) gripper_pos array so
+    that transition points are detected correctly before any steps are removed.
+    """
+    if not TRIM_PAUSE_WINDOWS:
+        return keep
+    gripper_raw = np.asarray(data["gripper_pos"])[:keep.size]
+    return keep & ~_pause_mask(gripper_raw)
 
 
 def ensure_2d(x):
@@ -173,14 +280,29 @@ def resize_obs(obs: np.ndarray, size: int) -> np.ndarray:
 
 
 def build_prop(data, keep):
-    """Build the proprioception array for one episode."""
+    """Build the proprioception array for one episode.
+
+    Returns (prop, gripper_pos_unnorm) where:
+      - prop              — the observation vector stored in the dataset;
+                            gripper is normalized to [-1, +1].
+      - gripper_pos_unnorm — the raw gripper_pos values (still needed for
+                            action labeling, pause-mask detection, etc.).
+    """
     gripper_pos_unnorm = np.asarray(data["gripper_pos"])[keep]
+
+    # Normalize gripper to [-1, +1] for the observation.
+    # Raw value is retained as gripper_pos_unnorm for all downstream logic.
+    denom = max(GRIPPER_PROP_MAX - GRIPPER_PROP_MIN, 1.0)
+    gripper_prop = np.clip(
+        2.0 * (gripper_pos_unnorm - GRIPPER_PROP_MIN) / denom - 1.0,
+        -1.0, 1.0,
+    )
 
     try:
         parts = [
             ensure_2d(np.asarray(data["ee_pos"])[keep]),
             ensure_2d(np.asarray(data["ee_yaw"])[keep]),
-            ensure_2d(gripper_pos_unnorm),
+            ensure_2d(gripper_prop),      # normalized, not raw
         ]
     except IndexError:
         breakpoint()
@@ -205,7 +327,7 @@ if SCALE_EE_TO_MPC:
         with open(f, "rb") as fh:
             data = pickle.load(fh)
         term = np.asarray(data["termination"])
-        keep = filter_termination_segments(term)
+        keep = apply_trim(filter_termination_segments(term), data)
         mpc_buf.append(np.asarray(data["action"])[keep])
         ee_buf.append(compute_ee_delta_actions(data, keep))
 
@@ -231,7 +353,7 @@ for f in pkl_files:
         data = pickle.load(fh)
 
     term = np.asarray(data["termination"])
-    keep = filter_termination_segments(term)
+    keep = apply_trim(filter_termination_segments(term), data)
 
     if SCALE_EE_TO_MPC:
         all_actions.append(scale_ee_to_mpc(compute_ee_delta_actions(data, keep), ee_scale))
@@ -269,7 +391,7 @@ for f in pkl_files:
         data = pickle.load(fh)
 
     term = np.asarray(data["termination"])
-    keep = filter_termination_segments(term)
+    keep = apply_trim(filter_termination_segments(term), data)
 
     data = { k: v[:keep.size] for k, v in data.items() }
 
@@ -310,7 +432,10 @@ for f in pkl_files:
             act_unnorm = zero_pause_actions(act_unnorm, gripper_pos_unnorm)
     act = normalize(act_unnorm, a_min, a_max)
 
-    next_gripper_pos = np.pad(gripper_pos[1:], (0, 1), mode='edge')
+    if RELABEL_PAUSE_GRIPPER:
+        next_gripper_pos = relabel_pause_gripper(gripper_pos, gripper_pos_unnorm)
+    else:
+        next_gripper_pos = np.pad(gripper_pos[1:], (0, 1), mode='edge')
     act_unnorm = np.concatenate((act_unnorm, next_gripper_pos[:, None]), axis=-1)
     act = np.concatenate((act, next_gripper_pos[:, None]), axis=-1)
 
@@ -359,7 +484,8 @@ action_mode = ("scale_ee_to_mpc" if SCALE_EE_TO_MPC
                else "zero_pause"   if ZERO_PAUSE_ACTIONS
                else "mpc")
 print(f"Saved dataset  (obs_mode={OBS_MODE!r}, action_mode={action_mode!r}, "
-      f"include_spam_pose={INCLUDE_SPAM_POSE})")
+      f"trim_pause={TRIM_PAUSE_WINDOWS}, relabel_pause={RELABEL_PAUSE_GRIPPER}, "
+      f"settle_frac={RELABEL_SETTLE_FRACTION}, include_spam_pose={INCLUDE_SPAM_POSE})")
 print("Shapes:")
 for k, v in processed_dataset.items():
     if isinstance(v, np.ndarray):
