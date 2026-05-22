@@ -173,6 +173,9 @@ class OneRobotGCRLManipulationNode(Node):
         # Tunables
         self._grasp_settle_sec = 1.00          # wait before actuating gripper
         self._grasp_pause_after_cmd_sec = 1.00 # time to remain paused after actuation
+        # Gripper normalization — must match GRIPPER_PROP_MIN/MAX in process_real_world_data.py
+        self._gripper_prop_min = 0.0
+        self._gripper_prop_max = 200.0
 
         # Initialize agent from ROS parameters.
         agent_config_path: str = self.get_parameter("agent_config_path").value
@@ -207,11 +210,13 @@ class OneRobotGCRLManipulationNode(Node):
             self.get_logger().info(f"Applied agent_config_overrides: {overrides}")
 
         self._obs_mode = "image" if "Pixel" in config['dataset_class'] else "proprio"
-        frame_stack = config.get('frame_stack') or 1  # config may store None; default to 1
-        self.get_logger().info(f"obs_mode={self._obs_mode!r}, frame_stack={frame_stack}")
+        self._frame_stack = config.get('frame_stack') or 1  # config may store None; default to 1
+        self.get_logger().info(f"obs_mode={self._obs_mode!r}, frame_stack={self._frame_stack}")
+
+        if self._frame_stack > 1:
+            self._obs_deque = deque(maxlen=self._frame_stack)
 
         if self._obs_mode == "image":
-            self._obs_deque = deque(maxlen=frame_stack)
             self.create_subscription(Image, '/camera/camera/color/image_raw', self._on_image, 10)
 
         with open(dataset_path, "rb") as f:
@@ -341,10 +346,18 @@ class OneRobotGCRLManipulationNode(Node):
         #                      twist.linear.y,
         #                      twist.linear.z])
 
+        # Normalize gripper_pos from raw [_gripper_prop_min, _gripper_prop_max] → [-1, +1]
+        # to match the convention used in process_real_world_data.py and the action space.
+        _denom = max(self._gripper_prop_max - self._gripper_prop_min, 1.0)
+        gripper_norm = float(np.clip(
+            2.0 * (gripper_pos - self._gripper_prop_min) / _denom - 1.0,
+            -1.0, 1.0,
+        ))
+
         parts = [# q, qd, eff,
                  pose_to_arr(pose),
                  # twist_to_arr(twist),
-                 np.array([gripper_pos], dtype=float)]
+                 np.array([gripper_norm], dtype=float)]
 
         if self._latest_obj_pose is not None and self._obs_mode != "image":
             parts.append(pose_to_arr(self._latest_obj_pose))
@@ -393,6 +406,11 @@ class OneRobotGCRLManipulationNode(Node):
                                                  self._real_gripper.get_current_position())
             if self._obs_mode == "image":
                 self._obs_deque.append(self._latest_image)
+                fs = self._obs_deque.maxlen
+                assert len(self._obs_deque) == fs, f"Need {fs} latest observations. Skipping."
+                observation = np.concatenate(list(self._obs_deque), axis=-1)
+            elif self._frame_stack > 1:
+                self._obs_deque.append(proprioception)
                 fs = self._obs_deque.maxlen
                 assert len(self._obs_deque) == fs, f"Need {fs} latest observations. Skipping."
                 observation = np.concatenate(list(self._obs_deque), axis=-1)
