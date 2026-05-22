@@ -261,7 +261,7 @@ class OneRobotGCRLManipulationNode(Node):
         agent_name = config['agent_name']
         agent_class = agent_registry[agent_name]
 
-        if agent_name in ["gcfbc", "gcfql"]:
+        if agent_name in ["gcfbc", "gcfql", "gciql"]:
             agent = agent_class.create(
                 0,
                 example_batch,
