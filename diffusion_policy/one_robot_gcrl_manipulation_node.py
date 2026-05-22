@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import csv
 import argparse
 import numpy as np
 from typing import List, Optional, Tuple, Sequence, Union
@@ -93,6 +94,10 @@ class OneRobotGCRLManipulationNode(Node):
         # Applied after loading the agent config file, mirroring --agent.key=value in training.
         # This format avoids YAML-special characters so it works unquoted on the ros2 CLI.
         self.declare_parameter("agent_config_overrides", "")
+        # Base directory under which per-agent log folders are created.
+        self.declare_parameter("log_dir_base", os.path.join(os.path.expanduser("~"), "gcrl_logs"))
+        # Policy temperature forwarded to agent.sample_actions.
+        self.declare_parameter("policy_temperature", 0.0)
 
         self.bridge = CvBridge()
         self._target_img_dim = None  # set from dataset after loading
@@ -272,6 +277,34 @@ class OneRobotGCRLManipulationNode(Node):
 
         self.agent = restore_agent(agent, checkpoint_path, checkpoint_epoch)
 
+        # --- Policy temperature ---
+        self._policy_temperature: float = float(
+            self.get_parameter("policy_temperature").value
+        )
+        self.get_logger().info(f"Policy temperature: {self._policy_temperature}")
+
+        # --- JAX RNG (split every step so the seed advances correctly) ---
+        self._rng = jax.random.PRNGKey(0)
+
+        # --- Rollout logging ---
+        _log_dir_base: str = self.get_parameter("log_dir_base").value
+        _agent_log_dir = os.path.join(_log_dir_base, agent_name)
+        os.makedirs(_agent_log_dir, exist_ok=True)
+        _run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        _log_path = os.path.join(_agent_log_dir, f"{_run_ts}.csv")
+        self._log_file = open(_log_path, "w", newline="")
+        self._csv_writer = csv.writer(self._log_file)
+        _n_joints = 6  # UR robot DOF
+        self._csv_writer.writerow(
+            ["timestamp_sec", "paused"]
+            + [f"q_{i}"   for i in range(_n_joints)]
+            + [f"qd_{i}"  for i in range(_n_joints)]
+            + [f"eff_{i}" for i in range(_n_joints)]
+            + ["ee_x", "ee_y", "ee_z", "ee_qx", "ee_qy", "ee_qz", "ee_qw"]
+            + ["obj_x", "obj_y", "obj_z", "obj_qx", "obj_qy", "obj_qz", "obj_qw"]
+        )
+        self.get_logger().info(f"Logging rollout data to {_log_path}")
+
         # --- Timing ---
         self._start_time = self.get_clock().now()
         self.end_elapsed_time = None
@@ -280,6 +313,17 @@ class OneRobotGCRLManipulationNode(Node):
         self.get_logger().info(
             f"Streaming pose goals at {self._rate_hz:.1f} Hz"
         )
+
+    def destroy_node(self):
+        """Flush and close the rollout log before tearing down the node."""
+        try:
+            if hasattr(self, "_log_file") and self._log_file and not self._log_file.closed:
+                self._log_file.flush()
+                self._log_file.close()
+                self.get_logger().info("Closed rollout log file.")
+        except Exception as e:
+            self.get_logger().warn(f"Error closing rollout log file: {e}")
+        super().destroy_node()
 
     def _denormalize_actions(self, actions_norm):
         denom = self._action_max - self._action_min
@@ -421,15 +465,52 @@ class OneRobotGCRLManipulationNode(Node):
             return
 
         #######################################################################
+        #                           LOG ROLLOUT STEP                          #
+        #######################################################################
+
+        _p   = self._latest_pose
+        _obj = self._latest_obj_pose
+        _q   = list(self._latest_q)   if self._latest_q   is not None else [float("nan")] * 6
+        _qd  = list(self._latest_qd)  if self._latest_qd  is not None else [float("nan")] * 6
+        _eff = list(self._latest_eff) if self._latest_eff is not None else [float("nan")] * 6
+        self._csv_writer.writerow(
+            [f"{t:.6f}", int(self._robot_paused)]
+            + [f"{v:.6f}" for v in _q]
+            + [f"{v:.6f}" for v in _qd]
+            + [f"{v:.6f}" for v in _eff]
+            + [
+                f"{_p.position.x:.6f}",    f"{_p.position.y:.6f}",    f"{_p.position.z:.6f}",
+                f"{_p.orientation.x:.6f}", f"{_p.orientation.y:.6f}", f"{_p.orientation.z:.6f}",
+                f"{_p.orientation.w:.6f}",
+            ]
+            + (
+                [
+                    f"{_obj.position.x:.6f}",    f"{_obj.position.y:.6f}",    f"{_obj.position.z:.6f}",
+                    f"{_obj.orientation.x:.6f}", f"{_obj.orientation.y:.6f}", f"{_obj.orientation.z:.6f}",
+                    f"{_obj.orientation.w:.6f}",
+                ]
+                if _obj is not None
+                else [float("nan")] * 7
+            )
+        )
+
+        #######################################################################
         #                             AGENT STEP                              #
         #######################################################################
 
+        self._rng, _seed = jax.random.split(self._rng)
         if self._obs_mode == "image":
             action_norm = self.agent.sample_actions(observation, proprioception,
-                                                    goals=self._goal_obs, seed=jax.random.PRNGKey(0))
+                                                    goals=self._goal_obs, seed=_seed,
+                                                    temperature=self._policy_temperature)
         else:
+            # self.get_logger().info(f"observation: {observation}")
             action_norm = self.agent.sample_actions(observation,
-                                                    goals=self._goal_obs, seed=jax.random.PRNGKey(0))
+                                                    goals=self._goal_obs, seed=_seed,
+                                                    temperature=self._policy_temperature)
+            # subgoals = info["subgoals"]
+            # self.get_logger().info(f"subgoals: {subgoals}")
+
         action_norm = np.asarray(action_norm)
 
         if self._needs_yaw:
